@@ -11,6 +11,22 @@ A Rust library for domain fronting - tunneling connections through HTTP POST req
 - `tls`: Enables TLS support via `rustls` (disabled by default)
 - `examples`: Enables example binaries (includes `tls`)
 
+## Building the server
+To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.95.0` version of the rust toolchain.
+```bash
+sudo apt install rustup build-essential
+rustup default stable
+```
+
+With the dependencies installed, the binary can be built via `cargo`.
+```
+cargo build --bin domain_fronting_server --features examples --release
+```
+
+The binary will reside in
+`$CARGO_TARGET_DIR/target/release/domain_fronting_server`, typically this is
+in `./target/release/domain_fronting_server`.
+
 ## Usage
 
 ### Client
