@@ -12,6 +12,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Domain fronting library for tunneling connections through HTTP POST requests.
 //!
@@ -55,6 +57,6 @@ impl DnsResolver for DefaultDnsResolver {
                 .map(|addrs| addrs.collect())
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .map_err(io::Error::other)?
     }
 }

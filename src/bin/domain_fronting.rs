@@ -12,6 +12,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
 
@@ -66,7 +68,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Send a simple HTTP GET request
     let url = url.unwrap_or_else(|| format!("https://{}/", host));
-    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", url, host);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        url, host
+    );
 
     log::info!("Sending request: {}", request.lines().next().unwrap_or(""));
     connection.write_all(request.as_bytes()).await?;

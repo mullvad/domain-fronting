@@ -12,6 +12,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Domain fronting client implementation.
 
@@ -21,11 +23,11 @@ use std::{
     future::Future,
     io::{self, Read},
     net::SocketAddr,
-    pin::{pin, Pin},
-    task::{ready, Poll, Waker},
+    pin::{Pin, pin},
+    task::{Poll, Waker, ready},
 };
 
-use bytes::{buf::Reader, Buf, BytesMut};
+use bytes::{Buf, BytesMut, buf::Reader};
 use http::{header, status::StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, client::conn::http1::SendRequest};
@@ -459,12 +461,12 @@ impl ProxyActor {
         let content_length = buffer.len();
         let body = Full::new(buffer);
 
-        hyper::Request::post(&format!("https://{}/", self.proxy_host))
+        hyper::Request::post(format!("https://{}/", self.proxy_host))
             .header(header::HOST, self.proxy_host.clone())
             .header(header::ACCEPT, "*/*")
             .header(&self.session_header_key, &format!("{}", self.session_id))
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, &format!("{}", content_length))
+            .header(header::CONTENT_LENGTH, format!("{}", content_length))
             .body(body)
             .unwrap()
     }
@@ -477,7 +479,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
     use tokio::{
-        io::{duplex, AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::TcpListener,
     };
 
