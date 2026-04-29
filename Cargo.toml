@@ -3,10 +3,10 @@ name = "domain-fronting"
 version = "0.1.0"
 edition = "2024"
 description = "Domain fronting client and server implementation for tunneling connections through HTTP POST requests"
+categories = [ "network-programming" ]
 keywords = ["domain-fronting", "networking"]
 license = "GPL-3.0-or-later"
 authors = ["Mullvad VPN"]
-minimum-version = "1.85.1"
 repository = "https://github.com/mullvad/domain-fronting"
 
 

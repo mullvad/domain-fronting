@@ -1,0 +1,10 @@
+[licenses]
+version = 2
+
+# Adding a license here has to be done carefully. Should only be done by team leads.
+allow = [
+  "GPL-3.0-or-later",
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+]
