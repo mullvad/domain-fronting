@@ -20,7 +20,7 @@
 //!
 //! # Client
 //!
-//! [`ProxyConnection`] implements [`AsyncRead`] + [`AsyncWrite`], tunneling data via HTTP POST requests.
+//! [`ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`], tunneling data via HTTP POST requests.
 //! The client establishes an HTTP/1.1 connection and uses POST requests with a session ID header
 //! to maintain a bidirectional stream over HTTP.
 //!
@@ -88,7 +88,7 @@
 //!
 //! # Testing
 //!
-//! Both client and server support generic [`AsyncRead`] + [`AsyncWrite`] streams for testing.
+//! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`] streams for testing.
 //! Use [`ProxyConnection::from_stream()`] and [`server::Sessions::with_connector()`] to inject
 //! custom transports like [`tokio::io::duplex`] for unit tests.
 //!
