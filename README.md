@@ -12,7 +12,7 @@ A Rust library for domain fronting - tunneling connections through HTTP POST req
 - `examples`: Enables example binaries (includes `tls`)
 
 ## Building the server
-To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.95.0` version of the rust toolchain.
+To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.85` version of the rust toolchain.
 ```bash
 sudo apt install rustup build-essential
 rustup default stable
