@@ -12,7 +12,7 @@ A Rust library for domain fronting - tunneling connections through HTTP POST req
 - `examples`: Enables example binaries (includes `tls`)
 
 ## Building the server
-To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.95.0` version of the rust toolchain.
+To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.85` version of the rust toolchain.
 ```bash
 sudo apt install rustup build-essential
 rustup default stable
@@ -186,4 +186,8 @@ The domain fronting protocol works as follows:
 
 ## License
 
-GPL-3.0
+Copyright (C) 2026 Mullvad VPN AB
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+For the full license agreement, see the [LICENSE](./LICENSE.md) file or find it at <https://www.gnu.org/licenses/gpl-3.0>.
