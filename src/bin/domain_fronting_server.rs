@@ -20,7 +20,7 @@ use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 struct Args {
     /// Hostname for the server
     #[clap(short = 'H', long)]
-    hostname: String,
+    hostname: Option<String>,
 
     /// Path to certificate file (PEM format). If omitted, plain TCP is used.
     #[clap(short = 'c', long)]
@@ -80,9 +80,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = Args::parse();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
-    let tls_acceptor = match (cert_path, key_path) {
-        (Some(cert_path), Some(key_path)) => {
+    let tls_acceptor = match (cert_path, key_path, hostname) {
+        (Some(cert_path), Some(key_path), Some(hostname)) => {
             log::info!("Starting TLS domain fronting server on {}", bind_addr);
+            log::info!("Hostname: {hostname}");
             log::info!("Cert path: {}", cert_path.display());
             log::info!("Key path: {}", key_path.display());
             let tls_config =
@@ -99,7 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    log::info!("Hostname: {}", hostname);
     log::info!("Upstream: {}", upstream);
 
     let listener = TcpListener::bind(bind_addr).await?;
