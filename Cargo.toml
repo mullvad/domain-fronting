@@ -3,7 +3,7 @@ name = "domain-fronting"
 version = "0.1.0"
 edition = "2021"
 description = "Domain fronting client and server implementation for tunneling connections through HTTP POST requests"
-license = "GPL-3.0"
+license = "GPL-3.0-or-later"
 
 [lib]
 crate-type = ["rlib", "staticlib"]
