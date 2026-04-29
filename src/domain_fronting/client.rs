@@ -459,12 +459,12 @@ impl ProxyActor {
         let content_length = buffer.len();
         let body = Full::new(buffer);
 
-        hyper::Request::post(&format!("https://{}/", self.proxy_host))
+        hyper::Request::post(format!("https://{}/", self.proxy_host))
             .header(header::HOST, self.proxy_host.clone())
             .header(header::ACCEPT, "*/*")
             .header(&self.session_header_key, &format!("{}", self.session_id))
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, &format!("{}", content_length))
+            .header(header::CONTENT_LENGTH, format!("{}", content_length))
             .body(body)
             .unwrap()
     }
