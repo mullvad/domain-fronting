@@ -14,10 +14,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use clap::Parser;
+use domain_fronting::domain_fronting::server::Sessions;
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use domain_fronting::domain_fronting::server::Sessions;
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use std::{
     fs::File,
@@ -59,10 +59,7 @@ struct Args {
     session_header: String,
 }
 
-fn load_tls_config(
-    cert_path: &Path,
-    key_path: &Path,
-) -> anyhow::Result<ServerConfig> {
+fn load_tls_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
     // Load certificate chain
     let cert_file = File::open(cert_path)?;
     let cert_chain =
@@ -106,13 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::task::spawn_blocking(move || load_tls_config(&cert_path, &key_path)).await?;
             Some(TlsAcceptor::from(Arc::new(tls_config?)))
         }
-        (None, None) => {
+        (None, None, None) => {
             log::info!("Starting plain TCP domain fronting server on {}", bind_addr);
             log::warn!("No TLS certificate provided - running without encryption");
             None
         }
         _ => {
-            return Err("Both --cert-path and --key-path must be provided together".into());
+            return Err("To enable TLS, all 3 arguments (--cert-path, --key-path and --hostname) must be used".into());
         }
     };
 
@@ -129,7 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         connections_since_report += 1;
         if last_report.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
             let transfers = sessions.take_successful_transfers();
-            log::info!("{connections_since_report} new connection(s), {transfers} successful transfer(s)");
+            log::info!(
+                "{connections_since_report} new connection(s), {transfers} successful transfer(s)"
+            );
             connections_since_report = 0;
             last_report = Some(Instant::now());
         }
