@@ -21,11 +21,11 @@ use std::{
     future::Future,
     io::{self, Read},
     net::SocketAddr,
-    pin::{pin, Pin},
-    task::{ready, Poll, Waker},
+    pin::{Pin, pin},
+    task::{Poll, Waker, ready},
 };
 
-use bytes::{buf::Reader, Buf, BytesMut};
+use bytes::{Buf, BytesMut, buf::Reader};
 use http::{header, status::StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, client::conn::http1::SendRequest};
@@ -477,7 +477,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
     use tokio::{
-        io::{duplex, AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::TcpListener,
     };
 

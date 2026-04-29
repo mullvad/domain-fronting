@@ -20,8 +20,8 @@ use std::{
     net::SocketAddr,
     pin::pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -382,8 +382,7 @@ mod tests {
     async fn session_removed_after_connection_timeout() {
         let (upstream, _upstream_remote) = tokio::io::duplex(8192);
         let connector = MockConnector::new(vec![upstream]);
-        let sessions =
-            Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
+        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
 
         let session_id = Uuid::new_v4();
 
@@ -419,8 +418,7 @@ mod tests {
         // Upstream that accepts writes but never sends data back
         let (upstream, _upstream_remote) = tokio::io::duplex(8192);
         let connector = MockConnector::new(vec![upstream]);
-        let sessions =
-            Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
+        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
 
         let session_id = Uuid::new_v4();
 
@@ -443,8 +441,7 @@ mod tests {
     async fn successful_transfer_counter_incremented() {
         let (upstream, mut upstream_remote) = tokio::io::duplex(8192);
         let connector = MockConnector::new(vec![upstream]);
-        let sessions =
-            Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
+        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
 
         let session_id = Uuid::new_v4();
 

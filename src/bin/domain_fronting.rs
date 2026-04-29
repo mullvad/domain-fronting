@@ -66,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Send a simple HTTP GET request
     let url = url.unwrap_or_else(|| format!("https://{}/", host));
-    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", url, host);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        url, host
+    );
 
     log::info!("Sending request: {}", request.lines().next().unwrap_or(""));
     connection.write_all(request.as_bytes()).await?;
