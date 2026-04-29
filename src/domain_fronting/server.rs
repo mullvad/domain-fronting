@@ -1,5 +1,14 @@
 use std::{
-    future::Future, hash::RandomState, io, net::SocketAddr, pin::pin, sync::Arc, time::Duration,
+    future::Future,
+    hash::RandomState,
+    io,
+    net::SocketAddr,
+    pin::pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use http::{Request, Response, StatusCode, header};
@@ -46,6 +55,7 @@ pub struct Sessions<C: UpstreamConnector = TcpConnector> {
     sessions: papaya::HashMap<Uuid, mpsc::Sender<SessionCommand>>,
     configuration: Configuration,
     connector: C,
+    successful_transfers: AtomicU64,
 }
 
 impl<C: UpstreamConnector> std::fmt::Debug for Sessions<C> {
@@ -86,6 +96,7 @@ impl<C: UpstreamConnector> Sessions<C> {
             },
             sessions: Default::default(),
             connector,
+            successful_transfers: AtomicU64::new(0),
         };
         Arc::new(sessions)
     }
@@ -178,6 +189,10 @@ impl<C: UpstreamConnector> Sessions<C> {
             .unwrap()
     }
 
+    pub fn take_successful_transfers(&self) -> u64 {
+        self.successful_transfers.swap(0, Ordering::Relaxed)
+    }
+
     pub fn remove_session(self: Arc<Self>, session: &Uuid) {
         log::debug!("Removing session {}", session);
         let _ = self.sessions.pin().remove(session);
@@ -189,6 +204,7 @@ struct Session<C: UpstreamConnector> {
     cmd_rx: mpsc::Receiver<SessionCommand>,
     session_id: Uuid,
     sessions: Arc<Sessions<C>>,
+    counted_transfer: bool,
 }
 
 impl<C: UpstreamConnector> Session<C> {
@@ -215,6 +231,7 @@ impl<C: UpstreamConnector> Session<C> {
             session_id,
             cmd_rx,
             sessions,
+            counted_transfer: false,
         })
     }
 
@@ -222,8 +239,9 @@ impl<C: UpstreamConnector> Session<C> {
         let Self {
             connection,
             cmd_rx,
-            sessions: _,
+            sessions,
             session_id,
+            counted_transfer,
         } = self;
         let mut deadline = pin!(sleep(CONNECTION_TIMEOUT));
         let mut read_buffer = vec![0u8; 1024 * 64];
@@ -247,6 +265,10 @@ impl<C: UpstreamConnector> Session<C> {
                     let response_bytes = match timeout(READ_TIMEOUT, connection.read(&mut read_buffer)).await {
                         Ok(Ok(bytes_read)) => {
                             deadline.set(sleep(CONNECTION_TIMEOUT));
+                            if bytes_read > 0 && !*counted_transfer {
+                                *counted_transfer = true;
+                                sessions.successful_transfers.fetch_add(1, Ordering::Relaxed);
+                            }
                             Bytes::copy_from_slice(&read_buffer[..bytes_read])
                         },
                         // drop everything on read error
@@ -398,5 +420,53 @@ mod tests {
             body.is_empty(),
             "Body should be empty when upstream does not respond within read timeout"
         );
+    }
+
+    /// Verify that the successful transfer counter increments once per session
+    /// when upstream returns data.
+    #[tokio::test(start_paused = true)]
+    async fn successful_transfer_counter_incremented() {
+        let (upstream, mut upstream_remote) = tokio::io::duplex(8192);
+        let connector = MockConnector::new(vec![upstream]);
+        let sessions =
+            Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
+
+        let session_id = Uuid::new_v4();
+
+        assert_eq!(sessions.take_successful_transfers(), 0);
+
+        // Spawn a task to write a response on the upstream side
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            // Read the client's data first
+            let _ = upstream_remote.read(&mut buf).await;
+            // Send response back
+            upstream_remote.write_all(b"response").await.unwrap();
+            // Keep the stream alive for subsequent requests
+            loop {
+                match upstream_remote.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        upstream_remote.write_all(b"response2").await.unwrap();
+                    }
+                }
+            }
+        });
+
+        // First request with upstream response should increment counter
+        let response = sessions
+            .clone()
+            .handle_request_inner(session_id, Bytes::from("hello"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(sessions.take_successful_transfers(), 1);
+
+        // Second request on same session should NOT increment again
+        let response = sessions
+            .clone()
+            .handle_request_inner(session_id, Bytes::from("hello again"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(sessions.take_successful_transfers(), 0);
     }
 }

@@ -10,6 +10,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
@@ -105,8 +106,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     let sessions = Sessions::new(upstream, session_header);
+    let mut connections_since_report: u64 = 0;
+    let mut last_report: Option<Instant> = None;
     loop {
         let (stream, addr) = listener.accept().await?;
+
+        connections_since_report += 1;
+        if last_report.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
+            let transfers = sessions.take_successful_transfers();
+            log::info!("{connections_since_report} new connection(s), {transfers} successful transfer(s)");
+            connections_since_report = 0;
+            last_report = Some(Instant::now());
+        }
 
         log::debug!("Accepted connection from {addr}");
 
