@@ -8,6 +8,7 @@ keywords = ["domain-fronting", "networking"]
 license = "GPL-3.0-or-later"
 authors = ["Mullvad VPN"]
 repository = "https://github.com/mullvad/domain-fronting"
+readme = "README.md"
 rust-version = "1.85.1"
 
 [lib]
