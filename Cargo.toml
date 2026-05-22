@@ -1,6 +1,6 @@
 [package]
 name = "domain-fronting"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Domain fronting client and server implementation for tunneling connections through HTTP POST requests"
 categories = [ "network-programming" ]
@@ -18,31 +18,32 @@ crate-type = ["rlib", "staticlib"]
 anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.2"
+futures = "0.3"
 http = "1.1.0"
 http-body-util = "0.1.2"
-hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
+hyper = { version = "1.8.1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 log = "0.4"
-papaya = "0.2"
-serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["net", "io-util", "time", "macros", "sync", "rt-multi-thread", "fs"] }
-uuid = { version = "1.4.1", features = ["v4", "serde"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+uuid = { version = "1.4.1", features = ["v4"] }
 
 # Optional dependencies
+clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }
 rustls-pki-types = { version = "1.0", optional = true }
 tokio-rustls = { version = "0.26.0", default-features = false, features = ["logging", "aws-lc-rs", "tls12"], optional = true }
-clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-futures = { version = "0.3", optional = true }
+webpki-roots = { version = "1.0.7", optional = true }
+kameo = "0.22.1"
+
 [dev-dependencies]
 tokio = { version = "1.42", features = ["test-util", "time"] }
 
 [features]
-default = []
 tls = ["rustls", "rustls-pki-types", "tokio-rustls"]
-examples = ["clap", "tracing-subscriber", "futures", "tls"]
+examples = ["clap", "tracing-subscriber", "tls", "tokio/io-std", "webpki-roots"]
 
 [[bin]]
 name = "domain_fronting"
@@ -50,4 +51,8 @@ required-features = ["examples"]
 
 [[bin]]
 name = "domain_fronting_server"
+required-features = ["examples"]
+
+[[bin]]
+name = "domain_fronting_stdio"
 required-features = ["examples"]

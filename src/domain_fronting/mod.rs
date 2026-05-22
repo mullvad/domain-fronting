@@ -15,16 +15,16 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Domain fronting for API connections.
+//! Domain fronting library for tunneling TCP connections through HTTP requests to bypass
+//! censorship and access restrictions.
 //!
-//! This module provides both client and server components for domain fronting,
-//! allowing API connections to be tunneled through HTTP POST requests.
+//! The library provides a domain fronting client and a server component.
 //!
 //! # Client
 //!
-//! [`ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`], tunneling data via HTTP POST requests.
-//! The client establishes an HTTP/1.1 connection and uses POST requests with a session ID header
-//! to maintain a bidirectional stream over HTTP.
+//! [`ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`],
+//! tunneling data via HTTP requests. The client connects to the proxy sets up a bidirectional
+//! stream over HTTP.
 //!
 //! ## Usage
 //!
@@ -38,9 +38,8 @@
 //! use std::sync::Arc;
 //!
 //! let df = DomainFronting::new(
-//!     "cdn.example.com".to_string(),
+//!     "https://cdn.example.com".parse().unwrap(),
 //!     "api.example.com".to_string(),
-//!     "X-Session-Id".to_string(),
 //! );
 //!
 //! let proxy_config = df.proxy_config().await?;
@@ -55,7 +54,7 @@
 //!         .with_no_client_auth()
 //! );
 //!
-//! let mut client = proxy_config.connect_with_tls(tls_config).await?;
+//! let mut client = proxy_config.connect_https1_1(tls_config).await?;
 //!
 //! // Use like a regular AsyncRead + AsyncWrite stream
 //! client.write_all(b"Hello").await?;
@@ -68,38 +67,49 @@
 //!
 //! # Server
 //!
-//! [`server::Sessions`] manages HTTP sessions, forwarding data to upstream servers.
-//! Each unique session ID (sent via a configurable session header) gets its own
-//! upstream TCP connection that persists across multiple HTTP requests.
+//! [`server::Server`] handles HTTP requests, forwarding data to the upstream endpoint.
 //!
 //! ## Usage
 //!
 //! ```no_run
-//! use domain_fronting::domain_fronting::server::Sessions;
+//! use domain_fronting::domain_fronting::server::{self, Server};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let sessions = Sessions::new(upstream_addr, "X-Session-Id".to_string());
+//! let config = server::Config::new(upstream_addr);
+//! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
-//! // sessions.handle_request(req).await
+//! // server.handle_request(request).await;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Testing
 //!
-//! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`] streams for testing.
-//! Use [`ProxyConnection::from_stream()`] and [`server::Sessions::with_connector()`] to inject
+//! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
+//! streams for testing. Use [`ProxyConnection::http2_from_stream()`] (or
+//! [`ProxyConnection::http1_1_from_streams`]) and [`server::Server::with_connector()`] to inject
 //! custom transports like [`tokio::io::duplex`] for unit tests.
 //!
 //! # Protocol
 //!
-//! - Each HTTP POST request contains data to send upstream
-//! - Response body contains data received from upstream
-//! - Empty POST requests are used for polling when no data needs to be sent
-//! - Session cleanup happens when the client disconnects or the upstream closes
+//! TCP data is tunneled through through the server using HTTP requests.
+//!
+//! - **Client -> CDN -> Server**: Data is sent as the body of repeated `POST`/`PATCH` requests.
+//! - **Client <- CDN <- Server**: The client issues one `GET` per session. The server streams
+//!   upstream data back in the response body.
+//! - **Server <-> Upstream**: The server opens one TCP stream to upstream per session.
+//!
+//! Requests must provide a session ID as an HTTP header (`X-Session: <random uuid>`). When the
+//! server  receives a `GET`/`POST` request for a previously unseen session ID, it will establish a
+//! new TCP connection to the upstream target and start tunneling data. Subsequent `PATCH` requests
+//! with the same session ID will push data to the same TCP connection.
+//!
+//! The client supports talking to the CDN with either HTTP/1.1 or HTTP/2. HTTP/2 should be preferred,
+//! but may not be supported by all CDNs. HTTP/1.1 requires two separate TCP/TLS connections
+//! (one per direction). HTTP/2 uses a single connection with two concurrent streams.
 
 use std::{io, net::SocketAddr};
 
@@ -109,14 +119,18 @@ mod client;
 pub mod server;
 
 pub use client::{ProxyConfig, ProxyConnection};
+use http::uri::Scheme;
+use http::{StatusCode, Uri};
 
 /// Errors that can occur when establishing a domain fronting connection.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Failed to establish TLS connection")]
     Tls(#[source] io::Error),
-    #[error("HTTP handshake failed")]
-    Handshake(#[from] hyper::Error),
+    #[error("Hyper error")]
+    Hyper(#[from] hyper::Error),
+    #[error("HTTP request returned {0}")]
+    HttpStatusCode(StatusCode),
     #[error("Connection failed")]
     Connection(#[source] io::Error),
     #[error("DNS resolution failed")]
@@ -127,29 +141,41 @@ pub enum Error {
 
 /// Configuration for creating a [`ProxyConfig`].
 ///
-/// Contains the fronting domain, session header key and target host.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Contains the fronting domain and proxy host.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DomainFronting {
-    /// Domain that will be used to connect to a CDN, used for SNI
-    front: String,
+    /// Domain that will be used to connect to a CDN.
+    front: Uri,
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,
-    /// HTTP header key used to identify sessions
-    session_header_key: String,
+    session_key: String,
 }
 
 impl DomainFronting {
-    pub fn new(front: String, proxy_host: String, session_header_key: String) -> Self {
+    pub fn new(front: Uri, proxy_host: String) -> Self {
         DomainFronting {
             front,
             proxy_host,
-            session_header_key,
+            session_key: Self::DEFAULT_SESSION_KEY.into(),
+        }
+    }
+
+    pub const DEFAULT_SESSION_KEY: &str = "X-Session";
+
+    pub fn with_session_key(self, session_key: String) -> Self {
+        Self {
+            session_key,
+            ..self
         }
     }
 
     /// Returns the fronting domain (used for SNI).
-    pub fn front(&self) -> &str {
+    pub fn front(&self) -> &Uri {
         &self.front
+    }
+
+    pub fn front_host(&self) -> &str {
+        self.front.host().unwrap_or_default()
     }
 
     /// Returns the proxy host (used for Host header).
@@ -157,23 +183,33 @@ impl DomainFronting {
         &self.proxy_host
     }
 
-    /// Returns the session header key.
-    pub fn session_header_key(&self) -> &str {
-        &self.session_header_key
+    pub fn session_key(&self) -> &str {
+        &self.session_key
+    }
+
+    pub fn tls(&self) -> bool {
+        // Assume TLS unless HTTP is specifically requested
+        self.front.scheme() != Some(&Scheme::HTTP)
+    }
+
+    /// Get the HTTP scheme in use.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls() { "https" } else { "http" }
     }
 
     pub async fn proxy_config(&self) -> Result<ProxyConfig, Error> {
         let dns_resolver = DefaultDnsResolver;
 
+        let uri = &self.front;
+
+        let port = uri.port_u16().or(self.tls().then_some(443)).unwrap_or(80);
+
         let addrs = dns_resolver
-            .resolve(self.front.clone())
+            .resolve(uri.host().unwrap_or_default())
             .await
             .map_err(Error::Dns)?;
-        let addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
+        let &addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
 
-        Ok(ProxyConfig::new(
-            SocketAddr::new(addr.ip(), 443),
-            self.clone(),
-        ))
+        Ok(ProxyConfig::new(SocketAddr::new(addr, port), self.clone()))
     }
 }

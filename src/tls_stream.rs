@@ -18,6 +18,7 @@
 //! Provides a TLS stream with SNI support.
 //!
 //! Users must provide their own `rustls::ClientConfig` with desired certificate validation.
+
 use std::{
     io::{self, ErrorKind},
     pin::Pin,

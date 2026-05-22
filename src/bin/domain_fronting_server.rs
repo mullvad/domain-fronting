@@ -16,7 +16,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use clap::Parser;
-use domain_fronting::domain_fronting::server::Sessions;
+use domain_fronting::{
+    DomainFronting,
+    domain_fronting::server::{Config, Server},
+};
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -56,9 +59,17 @@ struct Args {
     #[clap(short, long, default_value = "443")]
     port: u16,
 
-    /// Session header key used to identify client sessions
-    #[clap(short = 's', long)]
-    session_header: String,
+    /// Header key used for the session id.
+    #[clap(long, default_value = {DomainFronting::DEFAULT_SESSION_KEY})]
+    session_key: String,
+
+    /// Total timeout of each HTTP request, in seconds.
+    #[clap(long)]
+    total_timeout: Option<f32>,
+
+    /// Idle timeout of each HTTP request, in seconds.
+    #[clap(long)]
+    idle_timeout: Option<f32>,
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
@@ -91,7 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key_path,
         upstream,
         port,
-        session_header,
+        session_key,
+        total_timeout,
+        idle_timeout,
     } = Args::parse();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
@@ -119,17 +132,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let sessions = Sessions::new(upstream, session_header);
+    let mut config = Config::new(upstream).with_session_key(session_key);
+    config.total_timeout = total_timeout.map(Duration::from_secs_f32);
+    config.idle_timeout = idle_timeout.map(Duration::from_secs_f32);
+    let server = Server::new(config);
+
     let mut connections_since_report: u64 = 0;
     let mut last_report: Option<Instant> = None;
     loop {
         let (stream, addr) = listener.accept().await?;
 
         connections_since_report += 1;
-        if last_report.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
-            let transfers = sessions.take_successful_transfers();
+        if last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            let stats = server.take_stats();
             log::info!(
-                "{connections_since_report} new connection(s), {transfers} successful transfer(s)"
+                "{connections_since_report} new connection(s), bytes-tx={}, bytes-rx={}",
+                stats.bytes_tx,
+                stats.bytes_rx,
             );
             connections_since_report = 0;
             last_report = Some(Instant::now());
@@ -137,31 +156,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::debug!("Accepted connection from {addr}");
 
-        let sessions = sessions.clone();
+        let server = server.clone();
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             match tls_acceptor {
                 Some(acceptor) => match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
-                        serve_connection(TokioIo::new(tls_stream), sessions, addr).await;
+                        serve_connection(TokioIo::new(tls_stream), server, addr).await;
                     }
                     Err(err) => {
                         log::error!("TLS handshake failed for {addr}: {err}");
                     }
                 },
                 None => {
-                    serve_connection(TokioIo::new(stream), sessions, addr).await;
+                    serve_connection(TokioIo::new(stream), server, addr).await;
                 }
             }
         });
     }
 }
 
-async fn serve_connection<S>(io: S, sessions: Arc<Sessions>, addr: SocketAddr)
+async fn serve_connection<S>(io: S, server: Arc<Server>, addr: SocketAddr)
 where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| sessions.clone().handle_request(req).map(Ok::<_, String>));
+    let service = service_fn(move |req| server.clone().handle_request(req).map(Ok::<_, String>));
 
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, service)

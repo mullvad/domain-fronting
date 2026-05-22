@@ -15,22 +15,17 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Domain fronting library for tunneling connections through HTTP POST requests.
+//! Domain fronting library for tunneling TCP connections through HTTP requests to bypass
+//! censorship and access restrictions.
 //!
-//! This crate provides both client and server components for domain fronting,
-//! allowing API connections to be tunneled through HTTP POST requests.
-//!
-//! # Features
-//!
-//! - **Client**: [`domain_fronting::ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
-//! - **Server**: [`domain_fronting::server::Sessions`] manages HTTP sessions and forwards to upstream
-//! - **Testing**: Both components support custom transports for testing
+//! The library provides a domain fronting client and a server component.
+//! The client implements `AsyncRead` and `AsyncWrite` for use with async code.
 //!
 //! # Examples
 //!
 //! See the module documentation for [`domain_fronting`] for usage examples.
 
-use std::{io, net::SocketAddr};
+use std::{io, net::IpAddr};
 
 pub mod domain_fronting;
 #[cfg(feature = "tls")]
@@ -41,7 +36,7 @@ pub use domain_fronting::{DomainFronting, Error, ProxyConfig, ProxyConnection};
 /// DNS resolver trait for resolving hostnames to IP addresses.
 #[async_trait::async_trait]
 pub trait DnsResolver: 'static + Send + Sync {
-    async fn resolve(&self, host: String) -> io::Result<Vec<SocketAddr>>;
+    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>>;
 }
 
 /// Default DNS resolver that uses `ToSocketAddrs` (`getaddrinfo`).
@@ -49,14 +44,12 @@ pub struct DefaultDnsResolver;
 
 #[async_trait::async_trait]
 impl DnsResolver for DefaultDnsResolver {
-    async fn resolve(&self, host: String) -> io::Result<Vec<SocketAddr>> {
+    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         use std::net::ToSocketAddrs;
-        tokio::task::spawn_blocking(move || {
-            format!("{host}:443")
+        tokio::task::block_in_place(move || {
+            (host, 0u16)
                 .to_socket_addrs()
-                .map(|addrs| addrs.collect())
+                .map(|addrs| addrs.map(|a| a.ip()).collect())
         })
-        .await
-        .map_err(io::Error::other)?
     }
 }
