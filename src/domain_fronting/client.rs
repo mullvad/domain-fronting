@@ -528,7 +528,8 @@ mod tests {
         let (client_stream, server_stream) = duplex(8192);
 
         // Start proxy server with default TCP connector pointing to echo server
-        let sessions = server::Sessions::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
         // Spawn HTTP server on server_stream
@@ -603,7 +604,8 @@ mod tests {
         let (client_stream1, server_stream1) = duplex(8192);
         let (client_stream2, server_stream2) = duplex(8192);
 
-        let sessions = server::Sessions::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let sessions = server::Sessions::new(config);
 
         // Spawn server for first connection
         let sessions_clone1 = sessions.clone();
@@ -678,7 +680,8 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(8192);
-        let sessions = server::Sessions::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
         tokio::spawn(async move {
@@ -736,7 +739,8 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(65536);
-        let sessions = server::Sessions::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
         tokio::spawn(async move {

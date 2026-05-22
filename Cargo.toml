@@ -36,13 +36,14 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = ["logg
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 futures = { version = "0.3", optional = true }
+tokio-util = "0.7.18"
 [dev-dependencies]
 tokio = { version = "1.42", features = ["test-util", "time"] }
 
 [features]
-default = []
+default = ["examples"]
 tls = ["rustls", "rustls-pki-types", "tokio-rustls"]
-examples = ["clap", "tracing-subscriber", "futures", "tls"]
+examples = ["clap", "tracing-subscriber", "futures", "tls", "tokio/io-std"]
 
 [[bin]]
 name = "domain_fronting"

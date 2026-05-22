@@ -75,12 +75,13 @@
 //! ## Usage
 //!
 //! ```no_run
-//! use domain_fronting::domain_fronting::server::Sessions;
+//! use domain_fronting::domain_fronting::server::{Config, Sessions};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let sessions = Sessions::new(upstream_addr, "X-Session-Id".to_string());
+//! let config = Config::new(upstream_addr, "X-Session-Id".to_string());
+//! let sessions = Sessions::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
 //! // sessions.handle_request(req).await

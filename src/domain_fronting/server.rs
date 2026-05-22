@@ -16,11 +16,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
+    fmt::Display,
     future::Future,
-    hash::RandomState,
     io,
     net::SocketAddr,
-    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,72 +27,99 @@ use std::{
     time::Duration,
 };
 
+use bytes::BytesMut;
+use futures::{FutureExt, Stream, StreamExt, stream};
 use http::{Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
-use papaya::{HashMapRef, LocalGuard};
+use http_body_util::{BodyExt, Either, Empty, StreamBody};
+use hyper::body::{Body, Bytes, Frame};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-    sync::{mpsc, oneshot},
-    time::{sleep, timeout},
+    net::{TcpStream, tcp},
+    time::sleep,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Factory trait for creating upstream connections.
 ///
 /// This trait abstracts how upstream connections are created, allowing
 /// injection of test doubles or alternative transports.
 pub trait UpstreamConnector: Clone + Send + Sync + 'static {
-    /// The stream type produced by this connector.
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    /// The read-half of the stream roduced by this connector.
+    type Read: AsyncRead + Unpin + Send + 'static;
+    /// The write-half of the stream roduced by this connector.
+    type Write: AsyncWrite + Unpin + Send + 'static;
 
     /// Connect to the given address.
-    fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Stream>> + Send;
+    fn connect(
+        &self,
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<(Self::Read, Self::Write)>> + Send;
 }
 
-/// Default connector using TCP streams.
+/// Default connector using [`tokio`] TCP streams.
 #[derive(Clone, Default)]
 pub struct TcpConnector;
 
 impl UpstreamConnector for TcpConnector {
-    type Stream = TcpStream;
+    type Read = tcp::OwnedReadHalf;
+    type Write = tcp::OwnedWriteHalf;
 
-    async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        TcpStream::connect(addr).await
+    async fn connect(&self, addr: SocketAddr) -> io::Result<(Self::Read, Self::Write)> {
+        TcpStream::connect(addr).await.map(|tcp| tcp.into_split())
     }
 }
 
 /// Manages domain fronting sessions, routing HTTP requests to upstream connections.
 pub struct Sessions<C: UpstreamConnector = TcpConnector> {
-    sessions: papaya::HashMap<Uuid, mpsc::Sender<SessionCommand>>,
-    configuration: Configuration,
+    config: Config,
     connector: C,
-    successful_transfers: AtomicU64,
+    stats: Arc<AtomicStats>,
 }
 
 impl<C: UpstreamConnector> std::fmt::Debug for Sessions<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sessions")
-            .field("sessions", &self.sessions)
-            .field("configuration", &self.configuration)
+            .field("configuration", &self.config)
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug)]
-pub struct Configuration {
+pub struct Config {
     pub upstream: SocketAddr,
     pub session_header_key: String,
+    pub total_timeout: Option<Duration>,
+    pub idle_timeout: Option<Duration>,
+}
+
+impl Config {
+    pub fn new(upstream: SocketAddr, session_header_key: String) -> Self {
+        Self {
+            upstream,
+            session_header_key,
+            total_timeout: None,
+            idle_timeout: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AtomicStats {
+    bytes_tx: AtomicU64,
+    bytes_rx: AtomicU64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
 }
 
 impl Sessions<TcpConnector> {
     /// Create a new session manager with the default TCP connector.
-    pub fn new(upstream: SocketAddr, session_header_key: String) -> Arc<Self> {
-        Self::with_connector(upstream, session_header_key, TcpConnector)
+    pub fn new(config: Config) -> Arc<Self> {
+        Self::with_connector(config, TcpConnector)
     }
 }
 
@@ -101,276 +127,218 @@ impl<C: UpstreamConnector> Sessions<C> {
     /// Create a new session manager with a custom connector.
     ///
     /// This allows injecting test doubles or alternative transports.
-    pub fn with_connector(
-        upstream: SocketAddr,
-        session_header_key: String,
-        connector: C,
-    ) -> Arc<Self> {
+    pub fn with_connector(config: Config, connector: C) -> Arc<Self> {
         let sessions = Sessions {
-            configuration: Configuration {
-                upstream,
-                session_header_key,
-            },
-            sessions: Default::default(),
+            config,
             connector,
-            successful_transfers: AtomicU64::new(0),
+            stats: Arc::new(AtomicStats::default()),
         };
         Arc::new(sessions)
     }
 
-    pub async fn handle_request(
+    /// Connect to [`Configuration::upstream`] and start forwarding data between the HTTP request,
+    /// body and the upstream connection.
+    ///
+    /// # Errors
+    /// - If [`UpstreamConnector::connect`] returns an error, the status code will be `BAD REQUEST`.
+    /// - Otherwise, the status code will be `OK`.
+    /// - If any error occurs after `connect`, the stream will be abruptly terminated.
+    pub async fn handle_request<B, E>(
         self: Arc<Self>,
-        request: Request<Incoming>,
-    ) -> Response<Full<Bytes>> {
-        let Some(session_id) = request
-            .headers()
-            .get(&self.configuration.session_header_key)
+        request: Request<B>,
+    ) -> Response<Either<Empty<Bytes>, StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>>
+    where
+        B: Body<Data = Bytes, Error = E>,
+        B: Send + Unpin + 'static,
+        E: Display + Send + 'static,
+    {
+        let (head, request_stream) = request.into_parts();
+
+        // TODO: remove this?
+        let Some(_session_id) = head
+            .headers
+            .get(&self.config.session_header_key)
             .and_then(|value| Uuid::try_parse_ascii(value.as_ref()).ok())
         else {
-            return Self::handle_session_error();
+            return bad_request().map(Either::Left);
         };
 
-        let Ok(body) = request.collect().await.map(|b| b.to_bytes()) else {
-            return Self::handle_session_error();
-        };
+        let ct = CancellationToken::new();
 
-        self.handle_request_inner(session_id, body).await
-    }
+        if let Some(total_timeout) = self.config.total_timeout {
+            let ct = ct.clone();
+            tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
+                sleep(total_timeout).await;
+                ct.cancel();
+            }));
+        }
 
-    async fn handle_request_inner(
-        self: Arc<Self>,
-        session: Uuid,
-        data: Bytes,
-    ) -> Response<Full<Bytes>> {
-        let cmd_tx = {
-            let map = self.sessions.pin();
-            match map.get(&session) {
-                Some(tx) => tx.clone(),
-                None => self.clone().handle_new_session(session, map),
-            }
-        };
+        // TODO: timeout
+        let (upstream_read, upstream_write) =
+            match self.connector.connect(self.config.upstream).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("Failed to connect to upstream server: {e}");
+                    return bad_request().map(Either::Left);
+                }
+            };
 
-        return self
-            .clone()
-            .handle_existing_session_request(&cmd_tx, data)
-            .await;
-    }
+        // stream HTTP request data to upstream connection
+        tokio::spawn(
+            ct.clone()
+                .run_until_cancelled_owned(Self::http_body_to_writer(
+                    Arc::clone(&self.stats),
+                    request_stream,
+                    upstream_write,
+                    ct.clone(),
+                )),
+        );
 
-    async fn handle_existing_session_request(
-        self: Arc<Self>,
-        cmd_tx: &mpsc::Sender<SessionCommand>,
-        data: Bytes,
-    ) -> Response<Full<Bytes>> {
-        let Ok(body) = SessionCommand::send(data, cmd_tx).await else {
-            log::error!("Failed to send command to session");
-            return Self::handle_session_error();
-        };
+        // stream data from upstream connection into the HTTP response
+        let response_stream = self.reader_to_http_body(upstream_read, ct.clone());
 
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(Full::new(body))
-            .unwrap()
+            .body(Either::Right(response_stream))
+            .expect("Response is valid")
     }
 
-    fn handle_new_session(
-        self: Arc<Self>,
-        new_session: Uuid,
-        session_map: HashMapRef<
-            '_,
-            Uuid,
-            mpsc::Sender<SessionCommand>,
-            RandomState,
-            LocalGuard<'_>,
-        >,
-    ) -> mpsc::Sender<SessionCommand> {
-        let sessions = self.clone();
-        let session_id = new_session;
-        let (cmd_tx, cmd_rx) = mpsc::channel(1);
-        session_map.insert(new_session, cmd_tx.clone());
+    /// Read all bytes from `reader` into an HTTP body.
+    fn reader_to_http_body(
+        &self,
+        reader: C::Read,
+        ct: CancellationToken,
+    ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C>> {
+        struct StreamState<R> {
+            reader: R,
+            buf: BytesMut,
+            stats: Arc<AtomicStats>,
+            ct: CancellationToken,
+        }
 
-        tokio::spawn(async move {
-            let Ok(mut session) = Session::connect(cmd_rx, session_id, sessions).await else {
-                return;
-            };
-            session.run().await;
-        });
-
-        cmd_tx
-    }
-
-    fn handle_session_error() -> Response<Full<Bytes>> {
-        Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Full::new(Bytes::new()))
-            .unwrap()
-    }
-
-    pub fn take_successful_transfers(&self) -> u64 {
-        self.successful_transfers.swap(0, Ordering::Relaxed)
-    }
-
-    pub fn remove_session(self: Arc<Self>, session: &Uuid) {
-        log::debug!("Removing session {}", session);
-        let _ = self.sessions.pin().remove(session);
-    }
-}
-
-struct Session<C: UpstreamConnector> {
-    connection: C::Stream,
-    cmd_rx: mpsc::Receiver<SessionCommand>,
-    session_id: Uuid,
-    sessions: Arc<Sessions<C>>,
-    counted_transfer: bool,
-}
-
-impl<C: UpstreamConnector> Session<C> {
-    pub async fn connect(
-        cmd_rx: mpsc::Receiver<SessionCommand>,
-        session_id: Uuid,
-        sessions: Arc<Sessions<C>>,
-    ) -> io::Result<Self> {
-        let connection = match sessions
-            .connector
-            .connect(sessions.configuration.upstream)
-            .await
-        {
-            Ok(conn) => conn,
-            Err(err) => {
-                log::error!("Failed to connect to upstream server: {}", err);
-                sessions.remove_session(&session_id);
-                return Err(err);
-            }
+        let state = StreamState {
+            reader,
+            buf: BytesMut::new(),
+            stats: Arc::clone(&self.stats),
+            ct,
         };
 
-        Ok(Self {
-            connection,
-            session_id,
-            cmd_rx,
-            sessions,
-            counted_transfer: false,
-        })
-    }
-
-    pub async fn run(&mut self) {
-        let Self {
-            connection,
-            cmd_rx,
-            sessions,
-            session_id,
-            counted_transfer,
-        } = self;
-        let mut deadline = pin!(sleep(CONNECTION_TIMEOUT));
-        let mut read_buffer = vec![0u8; 1024 * 64];
-
-        loop {
-            let deadline_ref = deadline.as_mut();
-            tokio::select! {
-                maybe_cmd = cmd_rx.recv() => {
-                    let Some(mut cmd) = maybe_cmd else {
-                        return;
-                    };
-
-                    if let Some(tx_bytes) = cmd.take_payload() {
-                        log::debug!("Received {} bytes for session {}", tx_bytes.len(), session_id);
-                        if let Err(err) =  connection.write_all(&tx_bytes).await {
-                            log::error!("Failed to send data to upstream: {err}");
-                        }
-
+        let stream = stream::unfold(state, move |mut state| {
+            let ct = state.ct.clone();
+            ct.clone()
+                .run_until_cancelled_owned(async move {
+                    // TODO: make values configurable
+                    if state.buf.capacity() < 1024 {
+                        state.buf.reserve(4096);
                     }
 
-                    let response_bytes = match timeout(READ_TIMEOUT, connection.read(&mut read_buffer)).await {
-                        Ok(Ok(bytes_read)) => {
-                            deadline.set(sleep(CONNECTION_TIMEOUT));
-                            if bytes_read > 0 && !*counted_transfer {
-                                *counted_transfer = true;
-                                sessions.successful_transfers.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Bytes::copy_from_slice(&read_buffer[..bytes_read])
-                        },
-                        // drop everything on read error
-                        Ok(Err(connection_error)) => {
-                            log::error!("Failed to receive data from upstream {connection_error}");
-                            return;
-                        },
-                        Err(_timeout) => Bytes::new(),
+                    let Ok(n) = state.reader.read_buf(&mut state.buf).await else {
+                        state.ct.cancel(); // Cancel the connection on any error
+                        return None;
                     };
-                    cmd.respond_with(response_bytes);
-                },
 
-                _ = deadline_ref => {
-                    return;
+                    if state.buf.is_empty() {
+                        return None; // EOF
+                    }
+
+                    state.stats.bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+
+                    Some((Ok(Frame::data(state.buf.split().freeze())), state))
+                })
+                .map(|option| option.flatten())
+        });
+
+        StreamBody::new(stream)
+    }
+
+    /// Write all [`Bytes`] from an HTTP body into an [`AsyncWrite`].
+    async fn http_body_to_writer<E>(
+        stats: Arc<AtomicStats>,
+        stream: impl Body<Data = Bytes, Error = E> + Unpin,
+        mut writer: impl AsyncWrite + Unpin,
+        ct: CancellationToken,
+    ) where
+        E: Display,
+    {
+        let mut stream = stream.into_data_stream();
+        loop {
+            let Some(data) = stream.next().await else {
+                log::debug!("[http->tcp] eof");
+                break;
+            };
+
+            let data = match data {
+                Ok(data) => data,
+                Err(e) => {
+                    log::debug!("[http->tcp] read error: {e}");
+                    ct.cancel(); // Cancel the connection on any error
+                    break;
                 }
-            }
+            };
+
+            if let Err(e) = writer.write_all(&data).await {
+                log::debug!("[http->tcp] write error: {e}");
+                ct.cancel(); // Cancel the connection on any error
+                break;
+            };
+
+            let n = data.len() as u64;
+            stats.bytes_tx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub fn take_stats(&self) -> Stats {
+        Stats {
+            bytes_tx: self.stats.bytes_tx.swap(0, Ordering::Relaxed),
+            bytes_rx: self.stats.bytes_rx.swap(0, Ordering::Relaxed),
         }
     }
 }
 
-impl<C: UpstreamConnector> Drop for Session<C> {
-    fn drop(&mut self) {
-        self.sessions.clone().remove_session(&self.session_id);
-    }
-}
-
-#[derive(Debug)]
-struct SessionCommand {
-    tx_payload: Option<Bytes>,
-    return_tx: oneshot::Sender<Bytes>,
-}
-
-impl SessionCommand {
-    async fn send(payload: Bytes, cmd_tx: &mpsc::Sender<SessionCommand>) -> anyhow::Result<Bytes> {
-        let (cmd, rx) = Self::new(payload);
-        cmd_tx.send(cmd).await?;
-        let payload = rx.await?;
-        Ok(payload)
-    }
-
-    fn new(tx_payload: Bytes) -> (Self, oneshot::Receiver<Bytes>) {
-        let (return_tx, rx) = oneshot::channel();
-        (
-            Self {
-                tx_payload: Some(tx_payload),
-                return_tx,
-            },
-            rx,
-        )
-    }
-    fn take_payload(&mut self) -> Option<Bytes> {
-        self.tx_payload.take()
-    }
-
-    fn respond_with(self, received_bytes: Bytes) {
-        let _ = self.return_tx.send(received_bytes);
-    }
+/// Build an HTTP [`Response`] with status code `400` and no data.
+fn bad_request() -> Response<Empty<Bytes>> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Empty::new())
+        .unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::DuplexStream;
+    use http_body_util::Full;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
 
-    /// Mock connector that returns pre-configured duplex streams.
+    /// Mock connector that just echoes incoming data.
     #[derive(Clone)]
-    struct MockConnector {
-        streams: Arc<tokio::sync::Mutex<Vec<DuplexStream>>>,
-    }
+    struct MockConnector {}
 
     impl MockConnector {
-        fn new(streams: Vec<DuplexStream>) -> Self {
-            Self {
-                streams: Arc::new(tokio::sync::Mutex::new(streams)),
-            }
+        fn new() -> Self {
+            Self {}
         }
     }
 
     impl UpstreamConnector for MockConnector {
-        type Stream = DuplexStream;
+        type Read = ReadHalf<DuplexStream>;
+        type Write = WriteHalf<DuplexStream>;
 
-        async fn connect(&self, _addr: SocketAddr) -> io::Result<DuplexStream> {
-            self.streams.lock().await.pop().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionRefused, "no streams available")
-            })
+        async fn connect(&self, _addr: SocketAddr) -> io::Result<(Self::Read, Self::Write)> {
+            let (local, mut remote) = tokio::io::duplex(8192);
+
+            // Spawn a task to write a response on the upstream side
+            tokio::spawn(async move {
+                let mut buf = [0u8; 100];
+                // Read the client's data first
+                let n = remote.read(&mut buf[..]).await.unwrap();
+                let data = &buf[..n];
+                // Echo the request, and some more
+                remote.write_all(b"general kenobi!").await.unwrap();
+                remote.write_all(data).await.unwrap();
+            });
+
+            Ok(split(local))
         }
     }
 
@@ -378,109 +346,50 @@ mod tests {
         "127.0.0.1:1234".parse().unwrap()
     }
 
-    /// Verify that a session is removed from the session map after
-    /// `CONNECTION_TIMEOUT` elapses with no incoming requests.
+    /// Verify that we can send and receive data, and that `take_stats` returns the correct values.
     #[tokio::test(start_paused = true)]
-    async fn session_removed_after_connection_timeout() {
-        let (upstream, _upstream_remote) = tokio::io::duplex(8192);
-        let connector = MockConnector::new(vec![upstream]);
-        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
+    async fn stats() {
+        let connector = MockConnector::new();
+        let session_key = "X-Session";
+        let config = Config::new(dummy_addr(), session_key.to_string());
+        let sessions = Sessions::with_connector(config, connector);
 
         let session_id = Uuid::new_v4();
 
-        // First request creates the session
-        let response = sessions
-            .clone()
-            .handle_request_inner(session_id, Bytes::from("hello"))
-            .await;
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Session should be tracked
-        assert!(
-            sessions.sessions.pin().get(&session_id).is_some(),
-            "Session should exist after first request"
-        );
-
-        // Advance time past CONNECTION_TIMEOUT with no further requests
-        tokio::time::advance(CONNECTION_TIMEOUT + Duration::from_secs(1)).await;
-        // Let the session task process the timeout and run its Drop cleanup
-        tokio::time::sleep(Duration::from_millis(1)).await;
-
-        // Session should have been cleaned up
-        assert!(
-            sessions.sessions.pin().get(&session_id).is_none(),
-            "Session should be removed after connection timeout"
-        );
-    }
-
-    /// Verify that when the upstream does not respond within `READ_TIMEOUT`,
-    /// the server returns an OK response with an empty body.
-    #[tokio::test(start_paused = true)]
-    async fn read_timeout_returns_empty_body() {
-        // Upstream that accepts writes but never sends data back
-        let (upstream, _upstream_remote) = tokio::io::duplex(8192);
-        let connector = MockConnector::new(vec![upstream]);
-        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
-
-        let session_id = Uuid::new_v4();
-
-        let response = sessions
-            .clone()
-            .handle_request_inner(session_id, Bytes::from("ping"))
-            .await;
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            body.is_empty(),
-            "Body should be empty when upstream does not respond within read timeout"
-        );
-    }
-
-    /// Verify that the successful transfer counter increments once per session
-    /// when upstream returns data.
-    #[tokio::test(start_paused = true)]
-    async fn successful_transfer_counter_incremented() {
-        let (upstream, mut upstream_remote) = tokio::io::duplex(8192);
-        let connector = MockConnector::new(vec![upstream]);
-        let sessions = Sessions::with_connector(dummy_addr(), "X-Session".to_string(), connector);
-
-        let session_id = Uuid::new_v4();
-
-        assert_eq!(sessions.take_successful_transfers(), 0);
-
-        // Spawn a task to write a response on the upstream side
-        tokio::spawn(async move {
-            let mut buf = [0u8; 64];
-            // Read the client's data first
-            let _ = upstream_remote.read(&mut buf).await;
-            // Send response back
-            upstream_remote.write_all(b"response").await.unwrap();
-            // Keep the stream alive for subsequent requests
-            loop {
-                match upstream_remote.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        upstream_remote.write_all(b"response2").await.unwrap();
-                    }
-                }
-            }
-        });
+        assert_eq!(sessions.take_stats(), Stats::default());
 
         // First request with upstream response should increment counter
         let response = sessions
             .clone()
-            .handle_request_inner(session_id, Bytes::from("hello"))
+            .handle_request(
+                Request::builder()
+                    .header(session_key, session_id.to_string())
+                    .body(Full::new(Bytes::from("hello there")))
+                    .unwrap(),
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(sessions.take_successful_transfers(), 1);
+        let body = response.collect().await.unwrap();
+        assert_eq!(body.to_bytes().len(), 26);
+        let stats = sessions.take_stats();
+        assert_eq!(stats.bytes_tx, 11);
+        assert_eq!(stats.bytes_rx, 26);
 
         // Second request on same session should NOT increment again
         let response = sessions
             .clone()
-            .handle_request_inner(session_id, Bytes::from("hello again"))
+            .handle_request(
+                Request::builder()
+                    .header(session_key, session_id.to_string())
+                    .body(Full::new(Bytes::from("hello again!!!")))
+                    .unwrap(),
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(sessions.take_successful_transfers(), 0);
+        let body = response.collect().await.unwrap();
+        assert_eq!(body.to_bytes().len(), 29);
+        let stats = sessions.take_stats();
+        assert_eq!(stats.bytes_tx, 14);
+        assert_eq!(stats.bytes_rx, 29);
     }
 }

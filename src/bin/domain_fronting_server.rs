@@ -16,7 +16,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use clap::Parser;
-use domain_fronting::domain_fronting::server::Sessions;
+use domain_fronting::domain_fronting::server::{Config, Sessions};
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -119,17 +119,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let sessions = Sessions::new(upstream, session_header);
+    let config = Config::new(upstream, session_header);
+    let sessions = Sessions::new(config);
     let mut connections_since_report: u64 = 0;
     let mut last_report: Option<Instant> = None;
     loop {
         let (stream, addr) = listener.accept().await?;
 
         connections_since_report += 1;
-        if last_report.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
-            let transfers = sessions.take_successful_transfers();
+        if last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            let stats = sessions.take_stats();
             log::info!(
-                "{connections_since_report} new connection(s), {transfers} successful transfer(s)"
+                "{connections_since_report} new connection(s), bytes-tx={}, bytes-rx={}",
+                stats.bytes_tx,
+                stats.bytes_rx,
             );
             connections_since_report = 0;
             last_report = Some(Instant::now());
