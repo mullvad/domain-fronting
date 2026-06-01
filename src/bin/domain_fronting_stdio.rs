@@ -21,7 +21,10 @@ use clap::Parser;
 use futures::stream;
 use http::{HeaderValue, Request};
 use http_body_util::{BodyExt, StreamBody};
-use hyper::body::Frame;
+use hyper::{
+    body::{Body, Frame},
+    client::conn::http1::SendRequest,
+};
 use hyper_util::rt::TokioIo;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout},
