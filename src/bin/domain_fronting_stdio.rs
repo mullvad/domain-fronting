@@ -74,3 +74,34 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+async fn start_proxy<B: Body + 'static>(mut http: SendRequest<B>, body: B) -> anyhow::Result<()> {
+    let mut stdout = stdout();
+
+    let request = Request::post("/")
+        .header(
+            "X-Session-Id",
+            HeaderValue::from_static("95c891ac-d08f-4722-b73c-42b1b8de1597"),
+        )
+        .body(body)
+        .expect("Request is valid");
+
+    let response = http
+        .send_request(request)
+        .await
+        .context("Failed to send HTTP request")?;
+    let (_head, mut body) = response.into_parts();
+
+    loop {
+        let frame = body
+            .frame()
+            .await
+            .context("No more frames")?
+            .context("Frame error")?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+
+        stdout.write_all(&data).await?;
+    }
+}
