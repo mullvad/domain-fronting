@@ -15,7 +15,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream;
