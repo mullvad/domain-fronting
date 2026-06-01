@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context(anyhow!("Failed to connect to {host:?}"))?;
 
-    let (mut http, connection) = hyper::client::conn::http1::Builder::new()
+    let (http, connection) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(tcp_stream))
         .await?;
 
