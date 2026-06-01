@@ -31,7 +31,6 @@ use tokio::{
     net::TcpStream,
     select,
 };
-use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 /// Send stdin/stdout through a domain fronting proxy.
 #[derive(Parser, Debug)]
