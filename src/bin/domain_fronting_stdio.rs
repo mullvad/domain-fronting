@@ -42,10 +42,6 @@ pub struct Arguments {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
-        .init();
-
     let Arguments { host } = Arguments::parse();
 
     let stdin = BufReader::new(stdin());
