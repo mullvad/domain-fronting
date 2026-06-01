@@ -44,10 +44,9 @@ pub struct Arguments {
 async fn main() -> anyhow::Result<()> {
     let Arguments { host } = Arguments::parse();
 
-    let stdin = BufReader::new(stdin());
-    let mut stdout = stdout();
-
-    let tcp_stream = TcpStream::connect(host).await?;
+    let tcp_stream = TcpStream::connect(&host)
+        .await
+        .context(anyhow!("Failed to connect to {host:?}"))?;
 
     let (mut http, connection) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(tcp_stream))
