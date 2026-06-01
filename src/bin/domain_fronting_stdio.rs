@@ -50,7 +50,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (http, connection) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(tcp_stream))
-        .await?;
+        .await
+        .context("HTTP handshake failed")?;
 
     let stdin_to_proxy = StreamBody::new(stream::unfold(stdin, |mut stdin| {
         Box::pin(async move {
