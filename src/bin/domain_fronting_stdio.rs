@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         })
     }));
 
-    let proxy = start_proxy(http, stdin_to_proxy);
+    let proxy = proxy_to_stdout(http, stdin_to_proxy);
 
     select! {
         r = connection => r?,
