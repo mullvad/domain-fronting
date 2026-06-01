@@ -1,6 +1,6 @@
 [package]
 name = "domain-fronting"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Domain fronting client and server implementation for tunneling connections through HTTP POST requests"
 categories = [ "network-programming" ]
