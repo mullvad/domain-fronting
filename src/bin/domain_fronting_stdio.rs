@@ -65,33 +65,7 @@ async fn main() -> anyhow::Result<()> {
         })
     }));
 
-    let proxy_to_stdout = async move {
-        let request = Request::post("/")
-            .header(
-                "X-Session-Id",
-                HeaderValue::from_static("95c891ac-d08f-4722-b73c-42b1b8de1597"),
-            )
-            .body(stdin_to_proxy)
-            .unwrap();
-        let response = http.send_request(request).await.unwrap();
-        let (_head, mut body) = response.into_parts();
-
-        loop {
-            let frame = body
-                .frame()
-                .await
-                .context("No more frames")?
-                .context("Frame error")?;
-            let Ok(data) = frame.into_data() else {
-                continue;
-            };
-
-            stdout.write_all(&data).await?;
-        }
-
-        #[expect(unreachable_code)]
-        anyhow::Ok(())
-    };
+    let proxy = start_proxy(http, stdin_to_proxy);
 
     select! {
         _ = connection => {}
