@@ -75,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_proxy<B: Body + 'static>(mut http: SendRequest<B>, body: B) -> anyhow::Result<()> {
+/// Send a request to `http` and read the response to stdout
+async fn proxy_to_stdout<B: Body + 'static>(
+    mut http: SendRequest<B>,
+    body: B,
+) -> anyhow::Result<()> {
     let mut stdout = stdout();
 
     let request = Request::post("/")
