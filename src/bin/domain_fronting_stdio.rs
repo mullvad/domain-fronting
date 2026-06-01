@@ -68,8 +68,8 @@ async fn main() -> anyhow::Result<()> {
     let proxy = start_proxy(http, stdin_to_proxy);
 
     select! {
-        _ = connection => {}
-        _ = proxy_to_stdout => {}
+        r = connection => r?,
+        r = proxy => r?,
     }
 
     Ok(())
