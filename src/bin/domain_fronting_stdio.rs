@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("HTTP handshake failed")?;
 
+    // Create a Stream that reads from stdin and yields Frame<Bytes>
+    let stdin = BufReader::new(stdin());
     let stdin_to_proxy = StreamBody::new(stream::unfold(stdin, |mut stdin| {
         Box::pin(async move {
             let mut line = String::new();
