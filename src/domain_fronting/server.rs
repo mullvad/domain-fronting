@@ -136,7 +136,7 @@ impl<C: UpstreamConnector> Sessions<C> {
         Arc::new(sessions)
     }
 
-    /// Connect to [`Configuration::upstream`] and start forwarding data between the HTTP request,
+    /// Connect to [`Config::upstream`] and start forwarding data between the HTTP request,
     /// body and the upstream connection.
     ///
     /// # Errors
