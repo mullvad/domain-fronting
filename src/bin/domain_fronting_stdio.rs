@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let stdin_to_proxy = StreamBody::new(stream::unfold(stdin, |mut stdin| {
         Box::pin(async move {
             let mut line = String::new();
-            log::info!("read from outgoing stream");
+            // read a line from stdin, exiting on EOF
             stdin.read_line(&mut line).await.ok().filter(|&n| n > 0)?;
             dbg!(&line);
             let data = Bytes::from(line);
