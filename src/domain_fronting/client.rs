@@ -372,15 +372,15 @@ mod tests {
 
         // Start proxy server with default TCP connector pointing to echo server
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Server::new(config);
-        let sessions_clone = sessions.clone();
+        let server = server::Server::new(config);
+        let server_clone = server.clone();
 
         // Spawn HTTP server on server_stream
         tokio::spawn(async move {
             let io = TokioIo::new(server_stream);
             let service = hyper::service::service_fn(move |req| {
-                let sessions = sessions_clone.clone();
-                async move { Ok::<_, Infallible>(sessions.handle_request(req).await) }
+                let server = server_clone.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
 
             let _ = hyper::server::conn::http1::Builder::new()
@@ -441,15 +441,15 @@ mod tests {
         let (client_stream2, server_stream2) = duplex(8192);
 
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Server::new(config);
+        let server = server::Server::new(config);
 
         // Spawn server for first connection
-        let sessions_clone1 = sessions.clone();
+        let server_clone1 = server.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(server_stream1);
             let service = hyper::service::service_fn(move |req| {
-                let sessions = sessions_clone1.clone();
-                async move { Ok::<_, Infallible>(sessions.handle_request(req).await) }
+                let server = server_clone1.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -457,12 +457,12 @@ mod tests {
         });
 
         // Spawn server for second connection
-        let sessions_clone2 = sessions.clone();
+        let server_clone2 = server.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(server_stream2);
             let service = hyper::service::service_fn(move |req| {
-                let sessions = sessions_clone2.clone();
-                async move { Ok::<_, Infallible>(sessions.handle_request(req).await) }
+                let server = server_clone2.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -510,14 +510,14 @@ mod tests {
 
         let (client_stream, server_stream) = duplex(8192);
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Server::new(config);
-        let sessions_clone = sessions.clone();
+        let server = server::Server::new(config);
+        let server_clone = server.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(server_stream);
             let service = hyper::service::service_fn(move |req| {
-                let sessions = sessions_clone.clone();
-                async move { Ok::<_, Infallible>(sessions.handle_request(req).await) }
+                let server = server_clone.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -559,14 +559,14 @@ mod tests {
 
         let (client_stream, server_stream) = duplex(65536);
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Server::new(config);
-        let sessions_clone = sessions.clone();
+        let server = server::Server::new(config);
+        let server_clone = server.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(server_stream);
             let service = hyper::service::service_fn(move |req| {
-                let sessions = sessions_clone.clone();
-                async move { Ok::<_, Infallible>(sessions.handle_request(req).await) }
+                let server = server_clone.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)

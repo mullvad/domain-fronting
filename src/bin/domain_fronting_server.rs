@@ -60,9 +60,17 @@ struct Args {
     #[clap(long, default_value = "X-Auth")]
     auth_key: String,
 
-    /// Session header value used to authorize against the proxy.
+    /// Header value used to authorize against the proxy.
     #[clap(short = 'a', long)]
     auth: String,
+
+    /// Total timeout of each HTTP request, in seconds.
+    #[clap(long)]
+    total_timeout: Option<f32>,
+
+    /// Idle timeout of each HTTP request, in seconds.
+    #[clap(long)]
+    idle_timeout: Option<f32>,
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
@@ -97,6 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port,
         auth_key,
         auth,
+        total_timeout,
+        idle_timeout,
     } = Args::parse();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
@@ -124,8 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let config = Config::new(upstream, auth_key, auth);
-    let sessions = Server::new(config);
+    let mut config = Config::new(upstream, auth_key, auth);
+    config.total_timeout = total_timeout.map(Duration::from_secs_f32);
+    config.idle_timeout = idle_timeout.map(Duration::from_secs_f32);
+    let server = Server::new(config);
+
     let mut connections_since_report: u64 = 0;
     let mut last_report: Option<Instant> = None;
     loop {
@@ -133,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         connections_since_report += 1;
         if last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-            let stats = sessions.take_stats();
+            let stats = server.take_stats();
             log::info!(
                 "{connections_since_report} new connection(s), bytes-tx={}, bytes-rx={}",
                 stats.bytes_tx,
@@ -145,31 +158,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::debug!("Accepted connection from {addr}");
 
-        let sessions = sessions.clone();
+        let server = server.clone();
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             match tls_acceptor {
                 Some(acceptor) => match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
-                        serve_connection(TokioIo::new(tls_stream), sessions, addr).await;
+                        serve_connection(TokioIo::new(tls_stream), server, addr).await;
                     }
                     Err(err) => {
                         log::error!("TLS handshake failed for {addr}: {err}");
                     }
                 },
                 None => {
-                    serve_connection(TokioIo::new(stream), sessions, addr).await;
+                    serve_connection(TokioIo::new(stream), server, addr).await;
                 }
             }
         });
     }
 }
 
-async fn serve_connection<S>(io: S, sessions: Arc<Server>, addr: SocketAddr)
+async fn serve_connection<S>(io: S, server: Arc<Server>, addr: SocketAddr)
 where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| sessions.clone().handle_request(req).map(Ok::<_, String>));
+    let service = service_fn(move |req| server.clone().handle_request(req).map(Ok::<_, String>));
 
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, service)

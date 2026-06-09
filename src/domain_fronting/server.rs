@@ -70,7 +70,7 @@ impl UpstreamConnector for TcpConnector {
     }
 }
 
-/// Manages domain fronting sessions, routing HTTP requests to upstream connections.
+/// Domain fronting server. Handles HTTP requests and proxies data over the [`UpstreamConnector`].
 pub struct Server<C: UpstreamConnector = TcpConnector> {
     config: Config,
     connector: C,
@@ -79,8 +79,9 @@ pub struct Server<C: UpstreamConnector = TcpConnector> {
 
 impl<C: UpstreamConnector> std::fmt::Debug for Server<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sessions")
-            .field("configuration", &self.config)
+        f.debug_struct("Server")
+            .field("config", &self.config)
+            .field("stats", &self.stats.freeze())
             .finish_non_exhaustive()
     }
 }
@@ -124,23 +125,23 @@ pub struct Stats {
 }
 
 impl Server<TcpConnector> {
-    /// Create a new session manager with the default TCP connector.
+    /// Create a new server with the default TCP connector.
     pub fn new(config: Config) -> Arc<Self> {
         Self::with_connector(config, TcpConnector)
     }
 }
 
 impl<C: UpstreamConnector> Server<C> {
-    /// Create a new session manager with a custom connector.
+    /// Create a new server with a custom connector.
     ///
     /// This allows injecting test doubles or alternative transports.
     pub fn with_connector(config: Config, connector: C) -> Arc<Self> {
-        let sessions = Server {
+        let server = Server {
             config,
             connector,
             stats: Arc::new(AtomicStats::default()),
         };
-        Arc::new(sessions)
+        Arc::new(server)
     }
 
     /// Connect to [`Config::upstream`] and start forwarding data between the HTTP request,
@@ -279,10 +280,7 @@ impl<C: UpstreamConnector> Server<C> {
     }
 
     pub fn take_stats(&self) -> Stats {
-        Stats {
-            bytes_tx: self.stats.bytes_tx.swap(0, Ordering::Relaxed),
-            bytes_rx: self.stats.bytes_rx.swap(0, Ordering::Relaxed),
-        }
+        self.stats.take()
     }
 }
 
@@ -292,6 +290,24 @@ fn bad_request() -> Response<Empty<Bytes>> {
         .status(StatusCode::BAD_REQUEST)
         .body(Empty::new())
         .unwrap()
+}
+
+impl AtomicStats {
+    /// Make a copy of the current stats.
+    fn freeze(&self) -> Stats {
+        Stats {
+            bytes_tx: self.bytes_tx.load(Ordering::Relaxed),
+            bytes_rx: self.bytes_rx.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Make a copy of the current stats and zero `self`.
+    fn take(&self) -> Stats {
+        Stats {
+            bytes_tx: self.bytes_tx.swap(0, Ordering::Relaxed),
+            bytes_rx: self.bytes_rx.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,12 +359,12 @@ mod tests {
         let auth_key = "X-Auth";
         let auth_val = "password";
         let config = Config::new(dummy_addr(), auth_key.to_string(), auth_val.to_string());
-        let sessions = Server::with_connector(config, connector);
+        let server = Server::with_connector(config, connector);
 
-        assert_eq!(sessions.take_stats(), Stats::default());
+        assert_eq!(server.take_stats(), Stats::default());
 
-        // First request with upstream response should increment counter
-        let response = sessions
+        // Proxied data should increment stats counter
+        let response = server
             .clone()
             .handle_request(
                 Request::builder()
@@ -360,12 +376,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 26);
-        let stats = sessions.take_stats();
+        let stats = server.take_stats();
         assert_eq!(stats.bytes_tx, 11);
         assert_eq!(stats.bytes_rx, 26);
 
-        // Second request on same session should NOT increment again
-        let response = sessions
+        // Proxied data should have been zeroed by `take_stats`
+        let stats = server.take_stats();
+        assert_eq!(stats, Default::default());
+
+        // Proxied data should increment stats counter again
+        let response = server
             .clone()
             .handle_request(
                 Request::builder()
@@ -377,7 +397,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 29);
-        let stats = sessions.take_stats();
+        let stats = server.take_stats();
         assert_eq!(stats.bytes_tx, 14);
         assert_eq!(stats.bytes_rx, 29);
     }
