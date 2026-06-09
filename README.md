@@ -31,6 +31,8 @@ in `./target/release/domain_fronting_server`.
 
 ### Client
 
+See `bin/domain_fronting.rs` and `bin/domain_fronting_stdio.rs` for basic example clients.
+
 Enable the `tls` feature and supply your own `rustls::ClientConfig` with the certificate store of your choice:
 
 ```toml
@@ -47,9 +49,10 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
-        "cdn.example.com".to_string(),      // Fronting domain (CDN)
-        "api.example.com".to_string(),       // Proxy host
-        "X-Session-Id".to_string(),          // Session header key
+        "cdn.example.com".to_string(), // Fronting domain (CDN)
+        "api.example.com".to_string(), // Proxy host
+        "X-Auth".to_string(),          // Authorization header key
+        "shared-secret".to_string(),   // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -88,9 +91,10 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
-        "cdn.example.com".to_string(),
-        "api.example.com".to_string(),
-        "X-Session-Id".to_string(),
+        "cdn.example.com".to_string(), // Fronting domain (CDN)
+        "api.example.com".to_string(), // Proxy host
+        "X-Auth".to_string(),          // Authorization header key
+        "shared-secret".to_string(),   // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -121,16 +125,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server
 
 ```rust
-use domain_fronting::domain_fronting::server::Sessions;
+use domain_fronting::domain_fronting::server::{self, Server};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = "127.0.0.1:8080".parse()?;
-    let sessions = Sessions::new(upstream_addr, "X-Session-Id".to_string());
+    let config = server::Config::new(upstream_addr, "X-Auth".to_string(), "shared-secret".to_string());
+    let server = Server::new(config);
 
     // Use with hyper to handle HTTP requests
     // See examples/domain_fronting_server.rs for a complete example
+
+    // server.handle_request(request).await;
 
     Ok(())
 }
@@ -146,8 +153,10 @@ The crate includes two example binaries:
 cargo run --bin domain_fronting --features examples -- \
     --front cdn.example.com \
     --host api.example.com \
-    --session-header X-Session-Id
+    --auth "shared-secret"
 ```
+
+See also `bin/domain_fronting_stdio.rs`.
 
 ### Server Example
 
@@ -158,7 +167,7 @@ cargo run --bin domain_fronting_server --features examples -- \
     --key-path /path/to/key.pem \
     --upstream 127.0.0.1:8080 \
     --port 443 \
-    --session-header X-Session-Id
+    --auth "shared-secret"
 ```
 
 For plain TCP (no TLS):
@@ -168,7 +177,7 @@ cargo run --bin domain_fronting_server --features examples -- \
     --hostname api.example.com \
     --upstream 127.0.0.1:8080 \
     --port 8080 \
-    --session-header X-Session-Id
+    --auth "shared-secret"
 ```
 
 ## Protocol
@@ -178,11 +187,9 @@ The domain fronting protocol works as follows:
 1. Client establishes an HTTP/1.1 connection to the fronting domain (CDN)
 2. Client sends POST requests with:
    - `Host` header set to the target host
-   - Session ID header (configurable) with a unique UUID
-   - Request body containing data to send upstream
-3. Server maintains a persistent upstream connection for each session ID
-4. Server forwards client data to upstream and returns upstream response in HTTP response body
-5. Empty POST requests are used for polling when the client has no data to send
+   - Authorization header (configurable) with a shared secret
+3. Server establishes an upstream connection
+4. Server starts streaming data from the request body to upstream, and vice versa
 
 ## License
 

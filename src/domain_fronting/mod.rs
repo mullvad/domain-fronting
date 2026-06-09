@@ -76,12 +76,12 @@
 //! ## Usage
 //!
 //! ```no_run
-//! use domain_fronting::domain_fronting::server::{Config, Server};
+//! use domain_fronting::domain_fronting::server::{self, Server};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let config = Config::new(upstream_addr, "X-Auth".to_string(), "password".to_string());
+//! let config = server::Config::new(upstream_addr, "X-Auth".to_string(), "shared-secret".to_string());
 //! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
