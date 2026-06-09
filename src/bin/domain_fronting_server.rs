@@ -56,9 +56,13 @@ struct Args {
     #[clap(short, long, default_value = "443")]
     port: u16,
 
-    /// Session header key used to identify client sessions
-    #[clap(short = 's', long)]
-    session_header: String,
+    /// Header key used to authorize against the proxy.
+    #[clap(long, default_value = "X-Auth")]
+    auth_key: String,
+
+    /// Session header value used to authorize against the proxy.
+    #[clap(short = 'a', long)]
+    auth: String,
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
@@ -91,7 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key_path,
         upstream,
         port,
-        session_header,
+        auth_key,
+        auth,
     } = Args::parse();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
@@ -119,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let config = Config::new(upstream, session_header);
+    let config = Config::new(upstream, auth_key, auth);
     let sessions = Sessions::new(config);
     let mut connections_since_report: u64 = 0;
     let mut last_report: Option<Instant> = None;

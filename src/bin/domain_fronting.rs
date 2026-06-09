@@ -33,9 +33,13 @@ pub struct Arguments {
     #[arg(long)]
     host: String,
 
-    /// Session header key used to identify client sessions
-    #[clap(short = 's', long)]
-    session_header: String,
+    /// Header key used to authorize against the proxy.
+    #[clap(long, default_value = "X-Auth")]
+    auth_key: String,
+
+    /// Header value used to authorize against the proxy.
+    #[clap(short = 'a', long)]
+    auth: String,
 
     /// URL to fetch (defaults to a simple GET request)
     #[clap(short = 'u', long)]
@@ -51,11 +55,12 @@ async fn main() -> anyhow::Result<()> {
     let Arguments {
         front,
         host,
-        session_header,
+        auth_key,
+        auth,
         url,
     } = Arguments::parse();
 
-    let df = DomainFronting::new(front, host.clone(), session_header);
+    let df = DomainFronting::new(front, host.clone(), auth_key, auth);
 
     let proxy_config = df.proxy_config().await?;
 

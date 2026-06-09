@@ -27,18 +27,16 @@ use std::{
     time::Duration,
 };
 
-use bytes::BytesMut;
-use futures::{FutureExt, Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream::abortable};
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Either, Empty, StreamBody};
 use hyper::body::{Body, Bytes, Frame};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, tcp},
     time::sleep,
 };
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 
 /// Factory trait for creating upstream connections.
 ///
@@ -88,16 +86,18 @@ impl<C: UpstreamConnector> std::fmt::Debug for Sessions<C> {
 #[derive(Debug)]
 pub struct Config {
     pub upstream: SocketAddr,
-    pub session_header_key: String,
+    pub auth_header_val: String,
+    pub auth_header_key: String,
     pub total_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
 }
 
 impl Config {
-    pub fn new(upstream: SocketAddr, session_header_key: String) -> Self {
+    pub fn new(upstream: SocketAddr, auth_header_key: String, auth_header_val: String) -> Self {
         Self {
             upstream,
-            session_header_key,
+            auth_header_key,
+            auth_header_val,
             total_timeout: None,
             idle_timeout: None,
         }
@@ -154,12 +154,11 @@ impl<C: UpstreamConnector> Sessions<C> {
     {
         let (head, request_stream) = request.into_parts();
 
-        // TODO: remove this?
-        let Some(_session_id) = head
+        if head
             .headers
-            .get(&self.config.session_header_key)
-            .and_then(|value| Uuid::try_parse_ascii(value.as_ref()).ok())
-        else {
+            .get(&self.config.auth_header_key)
+            .is_none_or(|value| value != &self.config.auth_header_val)
+        {
             return bad_request().map(Either::Left);
         };
 
@@ -210,43 +209,16 @@ impl<C: UpstreamConnector> Sessions<C> {
         reader: C::Read,
         ct: CancellationToken,
     ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C>> {
-        struct StreamState<R> {
-            reader: R,
-            buf: BytesMut,
-            stats: Arc<AtomicStats>,
-            ct: CancellationToken,
-        }
+        let ct2 = ct.clone();
+        let stream = ReaderStream::new(reader)
+            .inspect_err(move |_| ct2.cancel())
+            .map_ok(Frame::data);
 
-        let state = StreamState {
-            reader,
-            buf: BytesMut::new(),
-            stats: Arc::clone(&self.stats),
-            ct,
-        };
-
-        let stream = stream::unfold(state, move |mut state| {
-            let ct = state.ct.clone();
-            ct.clone()
-                .run_until_cancelled_owned(async move {
-                    // TODO: make values configurable
-                    if state.buf.capacity() < 1024 {
-                        state.buf.reserve(4096);
-                    }
-
-                    let Ok(n) = state.reader.read_buf(&mut state.buf).await else {
-                        state.ct.cancel(); // Cancel the connection on any error
-                        return None;
-                    };
-
-                    if state.buf.is_empty() {
-                        return None; // EOF
-                    }
-
-                    state.stats.bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
-
-                    Some((Ok(Frame::data(state.buf.split().freeze())), state))
-                })
-                .map(|option| option.flatten())
+        // interrupt the stream it the CancellationToken is triggered
+        let (stream, abort_handle) = abortable(stream);
+        tokio::spawn(async move {
+            ct.cancelled().await;
+            abort_handle.abort();
         });
 
         StreamBody::new(stream)
@@ -308,7 +280,7 @@ fn bad_request() -> Response<Empty<Bytes>> {
 mod tests {
     use super::*;
     use http_body_util::Full;
-    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
+    use tokio::io::{AsyncReadExt as _, DuplexStream, ReadHalf, WriteHalf, split};
 
     /// Mock connector that just echoes incoming data.
     #[derive(Clone)]
@@ -350,11 +322,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stats() {
         let connector = MockConnector::new();
-        let session_key = "X-Session";
-        let config = Config::new(dummy_addr(), session_key.to_string());
+        let auth_key = "X-Auth";
+        let auth_val = "password";
+        let config = Config::new(dummy_addr(), auth_key.to_string(), auth_val.to_string());
         let sessions = Sessions::with_connector(config, connector);
-
-        let session_id = Uuid::new_v4();
 
         assert_eq!(sessions.take_stats(), Stats::default());
 
@@ -363,7 +334,7 @@ mod tests {
             .clone()
             .handle_request(
                 Request::builder()
-                    .header(session_key, session_id.to_string())
+                    .header(auth_key, auth_val)
                     .body(Full::new(Bytes::from("hello there")))
                     .unwrap(),
             )
@@ -380,7 +351,7 @@ mod tests {
             .clone()
             .handle_request(
                 Request::builder()
-                    .header(session_key, session_id.to_string())
+                    .header(auth_key, auth_val)
                     .body(Full::new(Bytes::from("hello again!!!")))
                     .unwrap(),
             )

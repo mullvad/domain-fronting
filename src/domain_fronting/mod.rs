@@ -40,7 +40,8 @@
 //! let df = DomainFronting::new(
 //!     "cdn.example.com".to_string(),
 //!     "api.example.com".to_string(),
-//!     "X-Session-Id".to_string(),
+//!     "X-Auth".to_string(),
+//!     "password".to_string(),
 //! );
 //!
 //! let proxy_config = df.proxy_config().await?;
@@ -110,6 +111,7 @@ mod client;
 pub mod server;
 
 pub use client::{ProxyConfig, ProxyConnection};
+use http::StatusCode;
 
 /// Errors that can occur when establishing a domain fronting connection.
 #[derive(thiserror::Error, Debug)]
@@ -118,6 +120,8 @@ pub enum Error {
     Tls(#[source] io::Error),
     #[error("HTTP handshake failed")]
     Handshake(#[from] hyper::Error),
+    #[error("HTTP request returned {0}")]
+    HttpStatusCode(StatusCode),
     #[error("Connection failed")]
     Connection(#[source] io::Error),
     #[error("DNS resolution failed")]
@@ -135,16 +139,24 @@ pub struct DomainFronting {
     front: String,
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,
-    /// HTTP header key used to identify sessions
-    session_header_key: String,
+    /// HTTP header key used to authorize the proxy request
+    auth_header_key: String,
+    /// HTTP header value used to authorize the proxy request
+    auth_header_val: String,
 }
 
 impl DomainFronting {
-    pub fn new(front: String, proxy_host: String, session_header_key: String) -> Self {
+    pub fn new(
+        front: String,
+        proxy_host: String,
+        auth_header_key: String,
+        auth_header_val: String,
+    ) -> Self {
         DomainFronting {
             front,
             proxy_host,
-            session_header_key,
+            auth_header_key,
+            auth_header_val,
         }
     }
 
@@ -158,9 +170,14 @@ impl DomainFronting {
         &self.proxy_host
     }
 
-    /// Returns the session header key.
-    pub fn session_header_key(&self) -> &str {
-        &self.session_header_key
+    /// Returns the auth header key.
+    pub fn auth_header_key(&self) -> &str {
+        &self.auth_header_key
+    }
+
+    /// Returns the auth header value.
+    pub fn auth_header_val(&self) -> &str {
+        &self.auth_header_val
     }
 
     pub async fn proxy_config(&self) -> Result<ProxyConfig, Error> {

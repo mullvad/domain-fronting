@@ -19,25 +19,23 @@
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::{
-    future::Future,
-    io::{self, Read},
-    net::SocketAddr,
-    pin::{Pin, pin},
-    task::{Poll, Waker, ready},
-};
+use std::{io, net::SocketAddr, pin::Pin, task::Poll};
 
-use bytes::{Buf, BytesMut, buf::Reader};
-use http::{header, status::StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Bytes, client::conn::http1::SendRequest};
+use futures::{SinkExt, StreamExt, TryFutureExt, TryStreamExt, sink::SinkMapErr, stream};
+use http::header;
+use http_body_util::{BodyDataStream, BodyExt, StreamBody};
+use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper_util::rt::TokioIo;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
-    task::JoinHandle,
+    task::AbortHandle,
 };
-use uuid::Uuid;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::{
+    io::{CopyToBytes, SinkWriter, StreamReader},
+    sync::{PollSendError, PollSender},
+};
 
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
@@ -84,7 +82,8 @@ impl ProxyConfig {
     /// let df = DomainFronting::new(
     ///     "cdn.example.com".to_string(),
     ///     "api.example.com".to_string(),
-    ///     "X-Session-Id".to_string(),
+    ///     "X-Auth".to_string(),
+    ///     "password".to_string(),
     /// );
     ///
     /// let proxy_config = df.proxy_config().await?;
@@ -135,8 +134,9 @@ impl ProxyConfig {
             .map_err(Error::Tls)?;
         ProxyConnection::from_stream(
             tls,
-            self.domain_fronting.proxy_host().to_string(),
-            self.domain_fronting.session_header_key().to_string(),
+            self.domain_fronting.proxy_host(),
+            self.domain_fronting.auth_header_key(),
+            self.domain_fronting.auth_header_val(),
         )
         .await
     }
@@ -151,27 +151,31 @@ impl ProxyConfig {
     {
         ProxyConnection::from_stream(
             stream,
-            self.domain_fronting.proxy_host().to_string(),
-            self.domain_fronting.session_header_key().to_string(),
+            self.domain_fronting.proxy_host(),
+            self.domain_fronting.auth_header_key(),
+            self.domain_fronting.auth_header_val(),
         )
         .await
     }
 }
 
-type RequestFuture = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
+/// A mess of types to convert a `Sink<Bytes>` into an [`AsyncWrite`].
+type RequestTx =
+    SinkWriter<SinkMapErr<CopyToBytes<PollSender<Bytes>>, fn(PollSendError<Bytes>) -> io::Error>>;
+
+/// A mess of types to convert a `Stream<Bytes>` into an [`AsyncRead`].
+type ResponseRx =
+    StreamReader<stream::MapErr<BodyDataStream<Incoming>, fn(hyper::Error) -> io::Error>, Bytes>;
 
 pub struct ProxyConnection {
-    bytes_received: usize,
-    reader: Reader<BytesMut>,
-    send_future: Option<RequestFuture>,
-    request_tx: mpsc::Sender<Bytes>,
-    response_rx: mpsc::Receiver<Bytes>,
-    // call waker whenever the send_future resolves.
-    read_waker: Option<Waker>,
-    // call waker whenever the send_future resolves.
-    write_waker: Option<Waker>,
-    // Keeping the connection task
-    connection_task: JoinHandle<()>,
+    /// [`AsyncWrite`] for the HTTP request body.
+    request_tx: RequestTx,
+
+    /// [`AsyncRead`] for the HTTP response body.
+    response_rx: ResponseRx,
+
+    /// Abort handle for the connection task
+    connection_task: AbortHandle,
 }
 
 impl ProxyConnection {
@@ -181,294 +185,123 @@ impl ProxyConnection {
     /// Use `ProxyConfig::connect_stream_with_tls` if you need TLS support.
     pub async fn from_stream<S>(
         stream: S,
-        proxy_host: String,
-        session_header_key: String,
+        proxy_host: &str,
+        auth_header_key: &str,
+        auth_header_val: &str,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let io = TokioIo::new(stream);
-        let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-        let connection_task = tokio::spawn(async move {
-            if let Err(err) = conn.await {
-                log::error!("Domain fronting connection failed: {:?}", err);
-            }
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+        let conn = conn.inspect_err(|err| {
+            log::error!("Domain fronting connection failed: {:?}", err);
         });
-        Self::initialize(sender, proxy_host, session_header_key, connection_task).await
-    }
+        let connection_task = tokio::spawn(conn).abort_handle();
 
-    async fn initialize(
-        mut sender: SendRequest<Full<Bytes>>,
-        proxy_host: String,
-        session_header_key: String,
-        connection_task: JoinHandle<()>,
-    ) -> Result<Self, Error> {
-        sender.ready().await?;
-        let (response_tx, response_rx) = mpsc::channel(1);
-        let (request_tx, request_rx) = mpsc::channel(1);
-        let actor = ProxyActor::new(
-            sender,
-            proxy_host,
-            session_header_key,
-            request_rx,
-            response_tx,
-        );
-        tokio::spawn(actor.run());
+        let (request_tx, request_rx) = mpsc::channel::<Bytes>(1);
+
+        // convert the mpsc::Sender to an AsyncWrite
+        let request_tx = CopyToBytes::new(PollSender::new(request_tx));
+        let request_tx = request_tx.sink_map_err(io::Error::other as fn(_) -> _);
+        let request_tx: RequestTx = SinkWriter::new(request_tx);
+
+        // convert the mpsc::Receiver to a Stream<io::Result<Frame<Bytes>>>
+        let request_rx = ReceiverStream::new(request_rx)
+            .map(Frame::data)
+            .map(io::Result::Ok);
+        let request_body = StreamBody::new(request_rx);
+
+        // exchange HTTP headers and get status code & start streaming data in the background
+        let request = create_request(proxy_host, auth_header_key, auth_header_val, request_body);
+        let response = sender.send_request(request).await?;
+
+        if !response.status().is_success() {
+            return Err(Error::HttpStatusCode(response.status()));
+        }
+
+        // convert the response `Incoming` to an `AsyncRead`
+        let response_rx = response
+            .into_body()
+            .into_data_stream()
+            .map_err(io::Error::other as fn(_) -> _);
+        let response_rx: ResponseRx = StreamReader::new(response_rx);
 
         Ok(Self {
-            bytes_received: 0,
-            reader: BytesMut::new().reader(),
             request_tx,
             response_rx,
-            send_future: None,
-            read_waker: None,
-            write_waker: None,
             connection_task,
         })
     }
+}
 
-    fn update_write_waker(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) {
-        let waker = cx.waker();
-        let stored_waker = self.write_waker.get_or_insert_with(|| waker.clone());
-        stored_waker.clone_from(waker);
-    }
-
-    fn update_read_waker(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) {
-        let waker = cx.waker();
-        let stored_waker = self.read_waker.get_or_insert_with(|| waker.clone());
-        stored_waker.clone_from(waker);
-    }
-
-    fn resolve_write_waker(mut self: Pin<&mut Self>) {
-        if let Some(waker) = self.write_waker.take() {
-            waker.wake();
-        }
-    }
-
-    fn resolve_read_waker(mut self: Pin<&mut Self>) {
-        if let Some(waker) = self.read_waker.take() {
-            waker.wake();
-        }
-    }
-
-    fn fill_recv_buffer(mut self: Pin<&mut Self>, response: Bytes) {
-        self.reader.get_mut().extend(response);
-    }
-
-    fn recv_buffer_empty(self: Pin<&Self>) -> bool {
-        self.reader.get_ref().remaining() == 0
-    }
-
-    fn create_send_future(
-        request_tx: mpsc::Sender<Bytes>,
-        payload: Bytes,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>> {
-        let send_future = async move { request_tx.send(payload).await.map_err(|_| ()) };
-        Box::pin(send_future)
-    }
+fn create_request<B: Body>(
+    proxy_host: &str,
+    auth_header_key: &str,
+    auth_header_val: &str,
+    body: B,
+) -> http::Request<B> {
+    hyper::Request::post(format!("https://{proxy_host}/"))
+        .header(header::HOST, proxy_host)
+        .header(header::ACCEPT, "*/*")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(auth_header_key, auth_header_val)
+        .body(body)
+        .unwrap()
 }
 
 impl AsyncRead for ProxyConnection {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.as_mut().update_read_waker(cx);
-        match self.as_mut().response_rx.poll_recv(cx) {
-            // indicate that the reader is shut down by reading 0 bytes.
-            Poll::Ready(None) => {
-                if self.as_ref().recv_buffer_empty() {
-                    self.as_mut().resolve_write_waker();
-                    let _ = self.as_mut().read_waker.take();
-                    return Poll::Ready(Ok(()));
-                }
-            }
-            Poll::Ready(Some(response)) => {
-                self.as_mut().fill_recv_buffer(response);
-            }
-            Poll::Pending => (),
-        };
-
-        let buffer_empty = self.as_ref().recv_buffer_empty();
-        if !buffer_empty {
-            match self.reader.read(buf.initialize_unfilled()) {
-                Ok(0) => (),
-                Ok(n) => {
-                    buf.advance(n);
-                    self.bytes_received += n;
-                    return Poll::Ready(Ok(()));
-                }
-                Err(err) => {
-                    return Poll::Ready(Err(err));
-                }
-            };
-        }
-
-        let request_tx = self.request_tx.clone();
-        let send_future = self
-            .send_future
-            .get_or_insert_with(|| Self::create_send_future(request_tx, Bytes::new()));
-
-        match ready!(pin!(send_future).poll(cx)) {
-            Ok(_) => {
-                self.as_mut().resolve_write_waker();
-                self.as_mut().resolve_read_waker();
-                self.send_future = None;
-                Poll::Pending
-            }
-            Err(_) => {
-                self.as_mut().resolve_write_waker();
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Actor shut down",
-                )))
-            }
-        }
+    ) -> std::task::Poll<io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(&mut self.response_rx), cx, buf)
     }
 }
 
 impl AsyncWrite for ProxyConnection {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.as_mut().update_write_waker(cx);
-
-        // If there's a pending send, wait for it to complete first
-        if let Some(future) = &mut self.send_future {
-            match ready!(pin!(future).poll(cx)) {
-                Ok(_) => {
-                    self.send_future = None;
-                    // Fall through to accept new data
-                }
-                Err(_) => {
-                    self.send_future = None;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Actor shut down",
-                    )));
-                }
-            }
-        }
-
-        // Accept the write by creating a new send future
-        let request_tx = self.request_tx.clone();
-        let payload = Bytes::copy_from_slice(buf);
-        self.send_future = Some(Self::create_send_future(request_tx, payload));
-        self.as_mut().resolve_read_waker();
-        Poll::Ready(Ok(buf.len()))
+    ) -> std::task::Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.request_tx), cx, buf)
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.request_tx), cx)
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.request_tx), cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write_vectored(Pin::new(&mut self.request_tx), cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        AsyncWrite::is_write_vectored(&self.request_tx)
     }
 }
 
 impl Drop for ProxyConnection {
     fn drop(&mut self) {
-        // Technically the conneciton task will be shut down once the last instance of the
-        // associated `SendRequest` is destoryed, but this behavior is not documented anywhere, as
-        // such, let's abort the task ourselves anyway.
+        // Technically the conneciton task will be shut down once the `request_tx` and `response_rx`
+        // streams are dropped, but this behavior is not documented anywhere. As such, let's abort
+        // the task ourselves anyway.
         self.connection_task.abort();
-    }
-}
-
-struct ProxyActor {
-    sender: SendRequest<Full<Bytes>>,
-    session_id: Uuid,
-    session_header_key: String,
-    proxy_host: String,
-    request_rx: mpsc::Receiver<Bytes>,
-    response_tx: mpsc::Sender<Bytes>,
-}
-
-impl ProxyActor {
-    fn new(
-        sender: SendRequest<Full<Bytes>>,
-        proxy_host: String,
-        session_header_key: String,
-        request_rx: mpsc::Receiver<Bytes>,
-        response_tx: mpsc::Sender<Bytes>,
-    ) -> Self {
-        Self {
-            sender,
-            session_id: Uuid::new_v4(),
-            session_header_key,
-            proxy_host,
-            request_rx,
-            response_tx,
-        }
-    }
-
-    async fn run(mut self) {
-        log::debug!("Starting proxy actor with session {}", self.session_id);
-        loop {
-            let Some(msg) = self.request_rx.recv().await else {
-                log::trace!("Shutting down proxy - rx channel has no writers");
-                return;
-            };
-
-            let request = self.create_request(msg);
-            if let Err(err) = self.sender.ready().await {
-                log::trace!(
-                    "Dropping proxy actor due to error when waiting for connection to be ready: {err}"
-                );
-                return;
-            };
-            let response = match self.sender.send_request(request).await {
-                Ok(response) => response,
-                Err(err) => {
-                    log::trace!(
-                        "Dropping proxy actor due to error when waiting for connection to be ready: {err}"
-                    );
-                    return;
-                }
-            };
-
-            if response.status() != StatusCode::OK {
-                log::debug!("Unexpected status code from proxy: {}", response.status());
-                return;
-            }
-
-            let body = match response.collect().await {
-                Ok(body) => body,
-                Err(err) => {
-                    log::debug!("Failed to read whole body of response: {err}");
-                    return;
-                }
-            };
-            let payload = body.to_bytes();
-            if !payload.is_empty() && self.response_tx.send(payload).await.is_err() {
-                log::trace!("Response receiver down, shutting down actor");
-                return;
-            }
-        }
-    }
-
-    fn create_request(&mut self, buffer: Bytes) -> http::Request<Full<Bytes>> {
-        let content_length = buffer.len();
-        let body = Full::new(buffer);
-
-        hyper::Request::post(format!("https://{}/", self.proxy_host))
-            .header(header::HOST, self.proxy_host.clone())
-            .header(header::ACCEPT, "*/*")
-            .header(&self.session_header_key, &format!("{}", self.session_id))
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, format!("{}", content_length))
-            .body(body)
-            .unwrap()
     }
 }
 
@@ -517,7 +350,17 @@ mod tests {
         addr
     }
 
-    const TEST_SESSION_HEADER: &str = "X-Test-Session";
+    const AUTH_HEADER: &str = "X-Auth";
+    const AUTH: &str = "password";
+
+    fn example_df_config() -> DomainFronting {
+        DomainFronting::new(
+            "example.com".to_string(),
+            "api.example.com".to_string(),
+            AUTH_HEADER.to_string(),
+            AUTH.to_string(),
+        )
+    }
 
     #[tokio::test]
     async fn test_client_server_bidirectional() {
@@ -528,7 +371,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(8192);
 
         // Start proxy server with default TCP connector pointing to echo server
-        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
         let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
@@ -546,14 +389,7 @@ mod tests {
         });
 
         // Create client connection using the in-memory stream (no TLS)
-        let proxy_config = ProxyConfig::new(
-            echo_addr,
-            DomainFronting::new(
-                "example.com".to_string(),
-                "api.example.com".to_string(),
-                TEST_SESSION_HEADER.to_string(),
-            ),
-        );
+        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client = proxy_config
             .connect_with_stream(client_stream)
@@ -604,7 +440,7 @@ mod tests {
         let (client_stream1, server_stream1) = duplex(8192);
         let (client_stream2, server_stream2) = duplex(8192);
 
-        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
         let sessions = server::Sessions::new(config);
 
         // Spawn server for first connection
@@ -634,14 +470,7 @@ mod tests {
         });
 
         // Create two client connections
-        let proxy_config = ProxyConfig::new(
-            echo_addr,
-            DomainFronting::new(
-                "example.com".to_string(),
-                "api.example.com".to_string(),
-                TEST_SESSION_HEADER.to_string(),
-            ),
-        );
+        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client1 = proxy_config
             .connect_with_stream(client_stream1)
@@ -680,7 +509,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(8192);
-        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
         let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
@@ -695,14 +524,7 @@ mod tests {
                 .await;
         });
 
-        let proxy_config = ProxyConfig::new(
-            echo_addr,
-            DomainFronting::new(
-                "example.com".to_string(),
-                "api.example.com".to_string(),
-                TEST_SESSION_HEADER.to_string(),
-            ),
-        );
+        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let client = proxy_config
             .connect_with_stream(client_stream)
@@ -710,15 +532,12 @@ mod tests {
             .expect("Failed to create client connection");
 
         // Grab a handle to the connection task before dropping
-        let connection_task = &client.connection_task;
+        let connection_task = client.connection_task.clone();
         // The task should still be running
         assert!(
             !connection_task.is_finished(),
             "Connection task should be running before drop"
         );
-
-        // Clone the abort handle so we can check task status after drop
-        let task_handle = client.connection_task.abort_handle();
 
         // Drop the proxy connection
         drop(client);
@@ -728,7 +547,7 @@ mod tests {
 
         // The connection task should now be finished (aborted)
         assert!(
-            task_handle.is_finished(),
+            connection_task.is_finished(),
             "Connection task should be stopped after ProxyConnection is dropped"
         );
     }
@@ -739,7 +558,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(65536);
-        let config = server::Config::new(echo_addr, TEST_SESSION_HEADER.to_string());
+        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
         let sessions = server::Sessions::new(config);
         let sessions_clone = sessions.clone();
 
@@ -754,14 +573,7 @@ mod tests {
                 .await;
         });
 
-        let proxy_config = ProxyConfig::new(
-            echo_addr,
-            DomainFronting::new(
-                "example.com".to_string(),
-                "api.example.com".to_string(),
-                TEST_SESSION_HEADER.to_string(),
-            ),
-        );
+        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client = proxy_config
             .connect_with_stream(client_stream)
