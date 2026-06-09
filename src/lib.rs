@@ -23,7 +23,7 @@
 //! # Features
 //!
 //! - **Client**: [`domain_fronting::ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
-//! - **Server**: [`domain_fronting::server::Sessions`] manages HTTP sessions and forwards to upstream
+//! - **Server**: [`domain_fronting::server::Server`] manages HTTP sessions and forwards to upstream
 //! - **Testing**: Both components support custom transports for testing
 //!
 //! # Examples

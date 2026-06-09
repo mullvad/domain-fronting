@@ -207,7 +207,7 @@ impl ProxyConnection {
         let request_tx: RequestTx = SinkWriter::new(request_tx);
 
         // convert the mpsc::Receiver to a Stream<io::Result<Frame<Bytes>>>
-        let request_rx = ReceiverStream::new(request_rx)
+        let request_rx = ReceiverStream::new(request_rx) // mpsc -> Stream
             .map(Frame::data)
             .map(io::Result::Ok);
         let request_body = StreamBody::new(request_rx);
@@ -372,7 +372,7 @@ mod tests {
 
         // Start proxy server with default TCP connector pointing to echo server
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Sessions::new(config);
+        let sessions = server::Server::new(config);
         let sessions_clone = sessions.clone();
 
         // Spawn HTTP server on server_stream
@@ -441,7 +441,7 @@ mod tests {
         let (client_stream2, server_stream2) = duplex(8192);
 
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Sessions::new(config);
+        let sessions = server::Server::new(config);
 
         // Spawn server for first connection
         let sessions_clone1 = sessions.clone();
@@ -510,7 +510,7 @@ mod tests {
 
         let (client_stream, server_stream) = duplex(8192);
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Sessions::new(config);
+        let sessions = server::Server::new(config);
         let sessions_clone = sessions.clone();
 
         tokio::spawn(async move {
@@ -559,7 +559,7 @@ mod tests {
 
         let (client_stream, server_stream) = duplex(65536);
         let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
-        let sessions = server::Sessions::new(config);
+        let sessions = server::Server::new(config);
         let sessions_clone = sessions.clone();
 
         tokio::spawn(async move {

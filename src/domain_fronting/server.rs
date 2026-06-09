@@ -15,6 +15,8 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Domain fronting server implementation. See [`Server`]
+
 use std::{
     fmt::Display,
     future::Future,
@@ -69,13 +71,13 @@ impl UpstreamConnector for TcpConnector {
 }
 
 /// Manages domain fronting sessions, routing HTTP requests to upstream connections.
-pub struct Sessions<C: UpstreamConnector = TcpConnector> {
+pub struct Server<C: UpstreamConnector = TcpConnector> {
     config: Config,
     connector: C,
     stats: Arc<AtomicStats>,
 }
 
-impl<C: UpstreamConnector> std::fmt::Debug for Sessions<C> {
+impl<C: UpstreamConnector> std::fmt::Debug for Server<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sessions")
             .field("configuration", &self.config)
@@ -85,10 +87,15 @@ impl<C: UpstreamConnector> std::fmt::Debug for Sessions<C> {
 
 #[derive(Debug)]
 pub struct Config {
+    /// Address of the upstream host.
     pub upstream: SocketAddr,
-    pub auth_header_val: String,
+    /// HTTP header _key_ used for the shared secret.
     pub auth_header_key: String,
+    /// Shared secret.
+    pub auth_header_val: String,
+    /// Total timeout of one HTTP request.
     pub total_timeout: Option<Duration>,
+    /// Timeout of one HTTP request when no data is being sent in either direction.
     pub idle_timeout: Option<Duration>,
 }
 
@@ -116,19 +123,19 @@ pub struct Stats {
     pub bytes_rx: u64,
 }
 
-impl Sessions<TcpConnector> {
+impl Server<TcpConnector> {
     /// Create a new session manager with the default TCP connector.
     pub fn new(config: Config) -> Arc<Self> {
         Self::with_connector(config, TcpConnector)
     }
 }
 
-impl<C: UpstreamConnector> Sessions<C> {
+impl<C: UpstreamConnector> Server<C> {
     /// Create a new session manager with a custom connector.
     ///
     /// This allows injecting test doubles or alternative transports.
     pub fn with_connector(config: Config, connector: C) -> Arc<Self> {
-        let sessions = Sessions {
+        let sessions = Server {
             config,
             connector,
             stats: Arc::new(AtomicStats::default()),
@@ -164,6 +171,8 @@ impl<C: UpstreamConnector> Sessions<C> {
 
         let ct = CancellationToken::new();
 
+        // TODO: implement self.config.idle timeout
+
         if let Some(total_timeout) = self.config.total_timeout {
             let ct = ct.clone();
             tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
@@ -172,15 +181,19 @@ impl<C: UpstreamConnector> Sessions<C> {
             }));
         }
 
-        // TODO: timeout
-        let (upstream_read, upstream_write) =
-            match self.connector.connect(self.config.upstream).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    log::error!("Failed to connect to upstream server: {e}");
-                    return bad_request().map(Either::Left);
-                }
-            };
+        let connect_fut = self.connector.connect(self.config.upstream);
+        let connect_fut = ct.run_until_cancelled(connect_fut);
+        let (upstream_read, upstream_write) = match connect_fut.await {
+            Some(Ok(conn)) => conn,
+            Some(Err(e)) => {
+                log::error!("Failed to connect to upstream server: {e}");
+                return bad_request().map(Either::Left);
+            }
+            None => {
+                log::error!("Timeout when connecting to upstream server");
+                return bad_request().map(Either::Left);
+            }
+        };
 
         // stream HTTP request data to upstream connection
         tokio::spawn(
@@ -203,14 +216,19 @@ impl<C: UpstreamConnector> Sessions<C> {
             .expect("Response is valid")
     }
 
-    /// Read all bytes from `reader` into an HTTP body.
+    /// Create a stream that reads all bytes from `reader` into an HTTP body.
     fn reader_to_http_body(
         &self,
         reader: C::Read,
         ct: CancellationToken,
     ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C>> {
         let ct2 = ct.clone();
+        let stats = Arc::clone(&self.stats);
         let stream = ReaderStream::new(reader)
+            .inspect_ok(move |bytes| {
+                let n = bytes.len() as u64;
+                stats.bytes_rx.fetch_add(n, Ordering::Relaxed);
+            })
             .inspect_err(move |_| ct2.cancel())
             .map_ok(Frame::data);
 
@@ -325,7 +343,7 @@ mod tests {
         let auth_key = "X-Auth";
         let auth_val = "password";
         let config = Config::new(dummy_addr(), auth_key.to_string(), auth_val.to_string());
-        let sessions = Sessions::with_connector(config, connector);
+        let sessions = Server::with_connector(config, connector);
 
         assert_eq!(sessions.take_stats(), Stats::default());
 

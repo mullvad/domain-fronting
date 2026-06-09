@@ -18,13 +18,13 @@
 //! Domain fronting for API connections.
 //!
 //! This module provides both client and server components for domain fronting,
-//! allowing API connections to be tunneled through HTTP POST requests.
+//! allowing API connections to be tunneled through an HTTP POST request.
 //!
 //! # Client
 //!
-//! [`ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`], tunneling data via HTTP POST requests.
-//! The client establishes an HTTP/1.1 connection and uses POST requests with a session ID header
-//! to maintain a bidirectional stream over HTTP.
+//! [`ProxyConnection`] implements [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`],
+//! tunneling data via HTTP POST requests. The client establishes an HTTP/1.1 connection
+//! and sets up a bidirectional stream over HTTP.
 //!
 //! ## Usage
 //!
@@ -69,39 +69,42 @@
 //!
 //! # Server
 //!
-//! [`server::Sessions`] manages HTTP sessions, forwarding data to upstream servers.
-//! Each unique session ID (sent via a configurable session header) gets its own
-//! upstream TCP connection that persists across multiple HTTP requests.
+//! [`server::Server`] handles HTTP requests, forwarding data to upstream servers.
+//! Each HTTP request gets its own upstream TCP connection, and the HTTP request/response body is
+//! streamed to/from the upstream connection.
 //!
 //! ## Usage
 //!
 //! ```no_run
-//! use domain_fronting::domain_fronting::server::{Config, Sessions};
+//! use domain_fronting::domain_fronting::server::{Config, Server};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let config = Config::new(upstream_addr, "X-Session-Id".to_string());
-//! let sessions = Sessions::new(config);
+//! let config = Config::new(upstream_addr, "X-Auth".to_string(), "password".to_string());
+//! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
-//! // sessions.handle_request(req).await
+//! // server.handle_request(request).await;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Testing
 //!
-//! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`] streams for testing.
-//! Use [`ProxyConnection::from_stream()`] and [`server::Sessions::with_connector()`] to inject
-//! custom transports like [`tokio::io::duplex`] for unit tests.
+//! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
+//! streams for testing. Use [`ProxyConnection::from_stream()`] and
+//! [`server::Server::with_connector()`] to inject custom transports like [`tokio::io::duplex`]
+//! for unit tests.
 //!
 //! # Protocol
 //!
-//! - Each HTTP POST request contains data to send upstream
-//! - Response body contains data received from upstream
-//! - Empty POST requests are used for polling when no data needs to be sent
-//! - Session cleanup happens when the client disconnects or the upstream closes
+//! - Each HTTP POST request creates a new TCP connection to upstream.
+//! - The body of the HTTP request is streamed _to_ upstream.
+//! - Data received _from_ upstream is streamed into the HTTP response body.
+//! - The HTTP POST request must provide a preshared secret.
+//!   This is not intended as a security feature, but to filter random bot traffic.
+//!   E.g. `X-Auth: abc123-shared-secret`
 
 use std::{io, net::SocketAddr};
 
@@ -132,7 +135,7 @@ pub enum Error {
 
 /// Configuration for creating a [`ProxyConfig`].
 ///
-/// Contains the fronting domain, session header key and target host.
+/// Contains the fronting domain, target host, and auth header.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DomainFronting {
     /// Domain that will be used to connect to a CDN, used for SNI

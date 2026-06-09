@@ -58,18 +58,19 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to resolve proxy")?;
 
-    let tcp_stream = TcpStream::connect(&host)
+    let tcp_stream = TcpStream::connect(&host) // TCP connect to cdn77
         .await
         .context(anyhow!("Failed to connect to {host:?}"))?;
 
-    let mut proxy = proxy_config
+    // do HTTP handshake and set up bidirectional stream over HTTP
+    let mut connection = proxy_config
         .connect_with_stream(tcp_stream)
         .await
         .context(anyhow!("Failed to establish proxy with {host:?}"))?;
 
     let mut stdio = tokio::io::join(stdin(), stdout());
 
-    copy_bidirectional(&mut proxy, &mut stdio).await?;
+    copy_bidirectional(&mut connection, &mut stdio).await?;
 
     Ok(())
 }

@@ -16,7 +16,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use clap::Parser;
-use domain_fronting::domain_fronting::server::{Config, Sessions};
+use domain_fronting::domain_fronting::server::{Config, Server};
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     let config = Config::new(upstream, auth_key, auth);
-    let sessions = Sessions::new(config);
+    let sessions = Server::new(config);
     let mut connections_since_report: u64 = 0;
     let mut last_report: Option<Instant> = None;
     loop {
@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn serve_connection<S>(io: S, sessions: Arc<Sessions>, addr: SocketAddr)
+async fn serve_connection<S>(io: S, sessions: Arc<Server>, addr: SocketAddr)
 where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
