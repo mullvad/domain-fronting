@@ -108,13 +108,15 @@
 
 use std::{io, net::SocketAddr};
 
+use crate::util::{deserialize_from_str, serialize_to_string};
 use crate::{DefaultDnsResolver, DnsResolver};
 
 mod client;
 pub mod server;
 
 pub use client::{ProxyConfig, ProxyConnection};
-use http::StatusCode;
+use http::uri::Scheme;
+use http::{StatusCode, Uri};
 
 /// Errors that can occur when establishing a domain fronting connection.
 #[derive(thiserror::Error, Debug)]
@@ -138,8 +140,10 @@ pub enum Error {
 /// Contains the fronting domain, target host, and auth header.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DomainFronting {
-    /// Domain that will be used to connect to a CDN, used for SNI
-    front: String,
+    /// Domain that will be used to connect to a CDN.
+    #[serde(serialize_with = "serialize_to_string")]
+    #[serde(deserialize_with = "deserialize_from_str")]
+    front: Uri,
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,
     /// HTTP header key used to authorize the proxy request
@@ -150,7 +154,7 @@ pub struct DomainFronting {
 
 impl DomainFronting {
     pub fn new(
-        front: String,
+        front: Uri,
         proxy_host: String,
         auth_header_key: String,
         auth_header_val: String,
@@ -164,8 +168,12 @@ impl DomainFronting {
     }
 
     /// Returns the fronting domain (used for SNI).
-    pub fn front(&self) -> &str {
+    pub fn front(&self) -> &Uri {
         &self.front
+    }
+
+    pub fn front_host(&self) -> &str {
+        &self.front.host().unwrap_or_default()
     }
 
     /// Returns the proxy host (used for Host header).
@@ -183,18 +191,24 @@ impl DomainFronting {
         &self.auth_header_val
     }
 
+    pub fn tls(&self) -> bool {
+        // Assume TLS unless HTTP is specifically requested
+        self.front.scheme() != Some(&Scheme::HTTP)
+    }
+
     pub async fn proxy_config(&self) -> Result<ProxyConfig, Error> {
         let dns_resolver = DefaultDnsResolver;
 
+        let uri = &self.front;
+
+        let port = uri.port_u16().or(self.tls().then_some(443)).unwrap_or(80);
+
         let addrs = dns_resolver
-            .resolve(self.front.clone())
+            .resolve(uri.host().unwrap_or_default())
             .await
             .map_err(Error::Dns)?;
-        let addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
+        let &addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
 
-        Ok(ProxyConfig::new(
-            SocketAddr::new(addr.ip(), 443),
-            self.clone(),
-        ))
+        Ok(ProxyConfig::new(SocketAddr::new(addr, port), self.clone()))
     }
 }

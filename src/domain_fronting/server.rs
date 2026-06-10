@@ -162,11 +162,9 @@ impl<C: UpstreamConnector> Server<C> {
     {
         let (head, request_stream) = request.into_parts();
 
-        if head
-            .headers
-            .get(&self.config.auth_header_key)
-            .is_none_or(|value| value != &self.config.auth_header_val)
-        {
+        let auth = head.headers.get(&self.config.auth_header_key);
+        if auth.is_none_or(|value| value != &self.config.auth_header_val) {
+            log::warn!("Invalid auth header: {auth:?}");
             return bad_request().map(Either::Left);
         };
 
@@ -213,6 +211,7 @@ impl<C: UpstreamConnector> Server<C> {
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::TRANSFER_ENCODING, "chunked")
             .body(Either::Right(response_stream))
             .expect("Response is valid")
     }

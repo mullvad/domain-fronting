@@ -15,20 +15,21 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use anyhow::{Context, anyhow};
+use std::sync::Arc;
+
+use anyhow::{Context as _, anyhow};
 use clap::Parser;
 use domain_fronting::DomainFronting;
-use tokio::{
-    io::{copy_bidirectional, stdin, stdout},
-    net::TcpStream,
-};
+use http::Uri;
+use tokio::io::{copy_bidirectional, stdin, stdout};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 /// Send stdin/stdout through a domain fronting proxy.
 #[derive(Parser, Debug)]
 pub struct Arguments {
     /// The domain used to hide the actual destination.
     #[arg(long)]
-    front: String,
+    front: Uri,
 
     /// The host being reached via `front`.
     #[arg(long)]
@@ -45,6 +46,10 @@ pub struct Arguments {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
+        .init();
+
     let Arguments {
         host,
         front,
@@ -52,25 +57,32 @@ async fn main() -> anyhow::Result<()> {
         auth,
     } = Arguments::parse();
 
-    let domain_fronting = DomainFronting::new(front, host.clone(), auth_key, auth);
+    let domain_fronting = DomainFronting::new(front.clone(), host.clone(), auth_key, auth);
     let proxy_config = domain_fronting
         .proxy_config()
         .await
         .context("Failed to resolve proxy")?;
 
-    let tcp_stream = TcpStream::connect(&host)
-        .await
-        .context(anyhow!("Failed to connect to {host:?}"))?;
+    let mut connection = if domain_fronting.tls() {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
 
-    // perform HTTP handshake and set up bidirectional stream over HTTP
-    let mut proxy_conn = proxy_config
-        .connect_with_stream(tcp_stream)
-        .await
-        .context(anyhow!("Failed to establish proxy with {host:?}"))?;
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        proxy_config.connect_with_tls(tls_config).await
+    } else {
+        proxy_config.connect_with_tcp().await
+    }
+    .context(anyhow!("Failed to connect to {host:?} with front {front}"))?;
 
     let mut stdio = tokio::io::join(stdin(), stdout());
 
-    copy_bidirectional(&mut proxy_conn, &mut stdio).await?;
+    copy_bidirectional(&mut connection, &mut stdio).await?;
 
     Ok(())
 }

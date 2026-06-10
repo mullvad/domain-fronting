@@ -129,9 +129,10 @@ impl ProxyConfig {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let tls = TlsStream::connect_with_config(stream, self.domain_fronting.front(), tls_config)
-            .await
-            .map_err(Error::Tls)?;
+        let tls =
+            TlsStream::connect_with_config(stream, self.domain_fronting.front_host(), tls_config)
+                .await
+                .map_err(Error::Tls)?;
         ProxyConnection::from_stream(
             tls,
             self.domain_fronting.proxy_host(),
@@ -139,6 +140,13 @@ impl ProxyConfig {
             self.domain_fronting.auth_header_val(),
         )
         .await
+    }
+
+    pub async fn connect_with_tcp(&self) -> Result<ProxyConnection, Error> {
+        let tcp_stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(Error::Connection)?;
+        self.connect_with_stream(tcp_stream).await
     }
 
     /// Connect with a custom stream
@@ -160,11 +168,11 @@ impl ProxyConfig {
 }
 
 /// A mess of types to convert a `Sink<Bytes>` into an [`AsyncWrite`].
-type RequestTx =
+pub type RequestTx =
     SinkWriter<SinkMapErr<CopyToBytes<PollSender<Bytes>>, fn(PollSendError<Bytes>) -> io::Error>>;
 
 /// A mess of types to convert a `Stream<Bytes>` into an [`AsyncRead`].
-type ResponseRx =
+pub type ResponseRx =
     StreamReader<stream::MapErr<BodyDataStream<Incoming>, fn(hyper::Error) -> io::Error>, Bytes>;
 
 pub struct ProxyConnection {
@@ -245,6 +253,7 @@ fn create_request<B: Body>(
         .header(header::HOST, proxy_host)
         .header(header::ACCEPT, "*/*")
         .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
         .header(auth_header_key, auth_header_val)
         .body(body)
         .unwrap()
@@ -355,7 +364,7 @@ mod tests {
 
     fn example_df_config() -> DomainFronting {
         DomainFronting::new(
-            "example.com".to_string(),
+            "example.com".parse().unwrap(),
             "api.example.com".to_string(),
             AUTH_HEADER.to_string(),
             AUTH.to_string(),

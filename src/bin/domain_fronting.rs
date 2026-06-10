@@ -17,17 +17,18 @@
 
 use std::sync::Arc;
 
+use anyhow::{Context as _, anyhow};
 use clap::Parser;
 use domain_fronting::DomainFronting;
+use http::Uri;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::rustls;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 #[derive(Parser, Debug)]
 pub struct Arguments {
     /// The domain used to hide the actual destination.
     #[arg(long)]
-    front: String,
+    front: Uri,
 
     /// The host being reached via `front`.
     #[arg(long)]
@@ -37,7 +38,7 @@ pub struct Arguments {
     #[clap(long, default_value = "X-Auth")]
     auth_key: String,
 
-    /// Header value used to authorize against the proxy.
+    /// Header value used to authorize against `host`.
     #[clap(short = 'a', long)]
     auth: String,
 
@@ -60,16 +61,28 @@ async fn main() -> anyhow::Result<()> {
         url,
     } = Arguments::parse();
 
-    let df = DomainFronting::new(front, host.clone(), auth_key, auth);
+    let domain_fronting = DomainFronting::new(front.clone(), host.clone(), auth_key, auth);
+    let proxy_config = domain_fronting
+        .proxy_config()
+        .await
+        .context("Failed to resolve proxy")?;
 
-    let proxy_config = df.proxy_config().await?;
+    let mut connection = if domain_fronting.tls() {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
 
-    let tls_config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth(),
-    );
-    let mut connection = proxy_config.connect_with_tls(tls_config).await?;
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        proxy_config.connect_with_tls(tls_config).await
+    } else {
+        proxy_config.connect_with_tcp().await
+    }
+    .context(anyhow!("Failed to connect to {host:?} with front {front}"))?;
 
     // Send a simple HTTP GET request
     let url = url.unwrap_or_else(|| format!("https://{}/", host));
