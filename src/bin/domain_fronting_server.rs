@@ -16,7 +16,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use clap::Parser;
-use domain_fronting::domain_fronting::server::{Config, Server};
+use domain_fronting::{
+    DomainFronting,
+    domain_fronting::server::{Config, Server},
+};
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -57,12 +60,16 @@ struct Args {
     port: u16,
 
     /// Header key used to authorize against the proxy.
-    #[clap(long, default_value = "X-Auth")]
+    #[clap(long, default_value = {DomainFronting::DEFAULT_AUTH_KEY})]
     auth_key: String,
 
     /// Header value used to authorize against the proxy.
     #[clap(short = 'a', long)]
     auth: String,
+
+    /// Header key used for the session id.
+    #[clap(long, default_value = {DomainFronting::DEFAULT_SESSION_KEY})]
+    session_key: String,
 
     /// Total timeout of each HTTP request, in seconds.
     #[clap(long)]
@@ -105,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port,
         auth_key,
         auth,
+        session_key,
         total_timeout,
         idle_timeout,
     } = Args::parse();
@@ -134,7 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let mut config = Config::new(upstream, auth_key, auth);
+    let mut config = Config::new(upstream, auth)
+        .with_auth_key(auth_key)
+        .with_session_key(session_key);
     config.total_timeout = total_timeout.map(Duration::from_secs_f32);
     config.idle_timeout = idle_timeout.map(Duration::from_secs_f32);
     let server = Server::new(config);

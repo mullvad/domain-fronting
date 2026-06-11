@@ -18,12 +18,14 @@
 //! Domain fronting server implementation. See [`Server`]
 
 use std::{
+    collections::HashMap,
     fmt::Display,
     future::Future,
     io,
     net::SocketAddr,
+    str::FromStr as _,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -39,6 +41,9 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
+use uuid::Uuid;
+
+use crate::DomainFronting;
 
 /// Factory trait for creating upstream connections.
 ///
@@ -75,6 +80,24 @@ pub struct Server<C: UpstreamConnector = TcpConnector> {
     config: Config,
     connector: C,
     stats: Arc<AtomicStats>,
+    sessions: Mutex<HashMap<Uuid, Weak<Session<C>>>>,
+}
+
+struct Session<C: UpstreamConnector> {
+    upstream_write: tokio::sync::Mutex<C::Write>,
+    ct: CancellationToken,
+    session_id: Uuid,
+    server: Weak<Server<C>>,
+}
+
+impl<C: UpstreamConnector> Drop for Session<C> {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.upgrade() {
+            self.ct.cancel();
+            let mut sessions = server.sessions.lock().unwrap();
+            sessions.remove(&self.session_id);
+        }
+    }
 }
 
 impl<C: UpstreamConnector> std::fmt::Debug for Server<C> {
@@ -86,14 +109,16 @@ impl<C: UpstreamConnector> std::fmt::Debug for Server<C> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Address of the upstream host.
     pub upstream: SocketAddr,
-    /// HTTP header _key_ used for the shared secret.
-    pub auth_header_key: String,
+    /// HTTP header key used for the shared secret.
+    pub auth_key: String,
     /// Shared secret.
-    pub auth_header_val: String,
+    pub auth: String,
+    /// HTTP header key used for the session id.
+    pub session_key: String,
     /// Total timeout of one HTTP request.
     pub total_timeout: Option<Duration>,
     /// Timeout of one HTTP request when no data is being sent in either direction.
@@ -101,13 +126,25 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(upstream: SocketAddr, auth_header_key: String, auth_header_val: String) -> Self {
+    pub fn new(upstream: SocketAddr, auth: String) -> Self {
         Self {
             upstream,
-            auth_header_key,
-            auth_header_val,
+            auth,
+            auth_key: DomainFronting::DEFAULT_AUTH_KEY.into(),
+            session_key: DomainFronting::DEFAULT_SESSION_KEY.into(),
             total_timeout: None,
             idle_timeout: None,
+        }
+    }
+
+    pub fn with_auth_key(self, auth_key: String) -> Self {
+        Self { auth_key, ..self }
+    }
+
+    pub fn with_session_key(self, session_key: String) -> Self {
+        Self {
+            session_key,
+            ..self
         }
     }
 }
@@ -139,7 +176,8 @@ impl<C: UpstreamConnector> Server<C> {
         let server = Server {
             config,
             connector,
-            stats: Arc::new(AtomicStats::default()),
+            stats: Default::default(),
+            sessions: Default::default(),
         };
         Arc::new(server)
     }
@@ -160,18 +198,78 @@ impl<C: UpstreamConnector> Server<C> {
         B: Send + Unpin + 'static,
         E: Display + Send + 'static,
     {
-        let (head, request_stream) = request.into_parts();
+        let (head, body) = request.into_parts();
 
-        let auth = head.headers.get(&self.config.auth_header_key);
-        if auth.is_none_or(|value| value != &self.config.auth_header_val) {
+        let auth = head.headers.get(&self.config.auth_key);
+        if auth.is_none_or(|value| value != &self.config.auth) {
             log::warn!("Invalid auth header: {auth:?}");
             return bad_request().map(Either::Left);
         };
 
+        let session_id = head
+            .headers
+            .get(&self.config.session_key)
+            .and_then(|s| s.to_str().ok())
+            .and_then(|s| Uuid::from_str(s).ok());
+
+        let Some(session_id) = session_id else {
+            return bad_request().map(Either::Left);
+        };
+
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .and_then(|weak| weak.upgrade());
+
+        if let Some(session) = session {
+            self.handle_existing_session(body, session)
+                .await
+                .map(Either::Left)
+        } else {
+            self.handle_new_session(session_id).await
+        }
+    }
+
+    /// Forward data from `request_body` to upstream for an existing session.
+    async fn handle_existing_session<E>(
+        self: Arc<Self>,
+        request_body: impl Body<Data = Bytes, Error = E> + Unpin,
+        session: Arc<Session<C>>,
+    ) -> Response<Empty<Bytes>>
+    where
+        E: Display,
+    {
+        let mut upstream_write = session.upstream_write.lock().await;
+        let n = session
+            .ct
+            .run_until_cancelled(Self::http_body_to_writer(
+                self.stats.clone(),
+                request_body,
+                &mut *upstream_write,
+                session.ct.clone(),
+            ))
+            .await;
+
+        match n {
+            Some(0) | None => bad_request(),
+            Some(1..) => Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Empty::new())
+                .expect("Response is valid"),
+        }
+    }
+
+    /// Create a new `session` and start streaming data from upstream in the response body.
+    async fn handle_new_session(
+        self: Arc<Self>,
+        session_id: Uuid,
+    ) -> Response<Either<Empty<Bytes>, StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>>
+    {
         let ct = CancellationToken::new();
 
         // TODO: implement self.config.idle timeout
-
         if let Some(total_timeout) = self.config.total_timeout {
             let ct = ct.clone();
             tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
@@ -194,24 +292,25 @@ impl<C: UpstreamConnector> Server<C> {
             }
         };
 
-        // stream HTTP request data to upstream connection
-        tokio::spawn(
-            ct.clone()
-                .run_until_cancelled_owned(Self::http_body_to_writer(
-                    Arc::clone(&self.stats),
-                    request_stream,
-                    upstream_write,
-                    ct.clone(),
-                )),
-        );
+        let session = Arc::new(Session {
+            upstream_write: tokio::sync::Mutex::new(upstream_write),
+            ct: ct.clone(),
+            server: Arc::downgrade(&self),
+            session_id,
+        });
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id, Arc::downgrade(&session));
 
         // stream data from upstream connection into the HTTP response
-        let response_stream = self.reader_to_http_body(upstream_read, ct.clone());
-
+        let response_stream = self.reader_to_http_body(upstream_read, session);
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
             .header(header::TRANSFER_ENCODING, "chunked")
+            .header(&self.config.session_key, session_id.to_string())
             .body(Either::Right(response_stream))
             .expect("Response is valid")
     }
@@ -220,16 +319,20 @@ impl<C: UpstreamConnector> Server<C> {
     fn reader_to_http_body(
         &self,
         reader: C::Read,
-        ct: CancellationToken,
+        session: Arc<Session<C>>,
     ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C>> {
-        let ct2 = ct.clone();
+        let ct = session.ct.clone();
         let stats = Arc::clone(&self.stats);
         let stream = ReaderStream::new(reader)
             .inspect_ok(move |bytes| {
                 let n = bytes.len() as u64;
                 stats.bytes_rx.fetch_add(n, Ordering::Relaxed);
             })
-            .inspect_err(move |_| ct2.cancel())
+            .inspect(move |_| {
+                // Cheeky way of moving `session` into the stream,
+                // such that it is kept alive until the stream closes.
+                _ = &session;
+            })
             .map_ok(Frame::data);
 
         // interrupt the stream it the CancellationToken is triggered
@@ -248,13 +351,14 @@ impl<C: UpstreamConnector> Server<C> {
         stream: impl Body<Data = Bytes, Error = E> + Unpin,
         mut writer: impl AsyncWrite + Unpin,
         ct: CancellationToken,
-    ) where
+    ) -> usize
+    where
         E: Display,
     {
         let mut stream = stream.into_data_stream();
+        let mut total_written = 0;
         loop {
             let Some(data) = stream.next().await else {
-                log::debug!("[http->tcp] eof");
                 break;
             };
 
@@ -262,20 +366,23 @@ impl<C: UpstreamConnector> Server<C> {
                 Ok(data) => data,
                 Err(e) => {
                     log::debug!("[http->tcp] read error: {e}");
-                    ct.cancel(); // Cancel the connection on any error
+                    ct.cancel();
                     break;
                 }
             };
 
             if let Err(e) = writer.write_all(&data).await {
                 log::debug!("[http->tcp] write error: {e}");
-                ct.cancel(); // Cancel the connection on any error
+                ct.cancel();
                 break;
             };
 
-            let n = data.len() as u64;
-            stats.bytes_tx.fetch_add(n, Ordering::Relaxed);
+            let n = data.len();
+            total_written += n;
+            stats.bytes_tx.fetch_add(n as u64, Ordering::Relaxed);
         }
+
+        total_written
     }
 
     pub fn take_stats(&self) -> Stats {
@@ -312,6 +419,7 @@ impl AtomicStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Method;
     use http_body_util::Full;
     use tokio::io::{AsyncReadExt as _, DuplexStream, ReadHalf, WriteHalf, split};
 
@@ -355,25 +463,40 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stats() {
         let connector = MockConnector::new();
-        let auth_key = "X-Auth";
-        let auth_val = "password";
-        let config = Config::new(dummy_addr(), auth_key.to_string(), auth_val.to_string());
-        let server = Server::with_connector(config, connector);
+        let auth = "password";
+        let config = Config::new(dummy_addr(), auth.to_string());
+        let server = Server::with_connector(config.clone(), connector);
 
         assert_eq!(server.take_stats(), Stats::default());
 
         // Proxied data should increment stats counter
-        let response = server
+        let session_id = Uuid::new_v4();
+        let reader = server
             .clone()
             .handle_request(
                 Request::builder()
-                    .header(auth_key, auth_val)
+                    .method(Method::GET)
+                    .header(&config.auth_key, auth)
+                    .header(&config.session_key, session_id.to_string())
+                    .body(Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .into_body();
+        assert!(!reader.is_end_stream());
+        let write_response = server
+            .clone()
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .header(&config.auth_key, auth)
+                    .header(&config.session_key, session_id.to_string())
                     .body(Full::new(Bytes::from("hello there")))
                     .unwrap(),
             )
             .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.collect().await.unwrap();
+        assert_eq!(write_response.status(), StatusCode::NO_CONTENT);
+        let body = reader.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 26);
         let stats = server.take_stats();
         assert_eq!(stats.bytes_tx, 11);
@@ -384,17 +507,33 @@ mod tests {
         assert_eq!(stats, Default::default());
 
         // Proxied data should increment stats counter again
-        let response = server
+        let session_id = Uuid::new_v4();
+        let reader = server
             .clone()
             .handle_request(
                 Request::builder()
-                    .header(auth_key, auth_val)
+                    .method(Method::GET)
+                    .header(&config.auth_key, auth)
+                    .header(&config.session_key, session_id.to_string())
+                    .body(Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .into_body();
+        assert!(!reader.is_end_stream());
+        let write_response = server
+            .clone()
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .header(&config.auth_key, auth)
+                    .header(&config.session_key, session_id.to_string())
                     .body(Full::new(Bytes::from("hello again!!!")))
                     .unwrap(),
             )
             .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.collect().await.unwrap();
+        assert_eq!(write_response.status(), StatusCode::NO_CONTENT);
+        let body = reader.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 29);
         let stats = server.take_stats();
         assert_eq!(stats.bytes_tx, 14);

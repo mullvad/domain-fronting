@@ -49,10 +49,9 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
-        "cdn.example.com".to_string(), // Fronting domain (CDN)
-        "api.example.com".to_string(), // Proxy host
-        "X-Auth".to_string(),          // Authorization header key
-        "shared-secret".to_string(),   // Shared secret
+        "https://cdn.example.com".parse().unwrap(), // Fronting domain (CDN)
+        "api.example.com".to_string(),              // Proxy host
+        "shared-secret".to_string(),                // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -66,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_no_client_auth()
     );
 
-    let mut client = proxy_config.connect_with_tls(tls_config).await?;
+    let mut client = proxy_config.connect_https1_1(tls_config).await?;
 
     // Use like a regular AsyncRead + AsyncWrite stream
     client.write_all(b"Hello").await?;
@@ -91,10 +90,9 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
-        "cdn.example.com".to_string(), // Fronting domain (CDN)
-        "api.example.com".to_string(), // Proxy host
-        "X-Auth".to_string(),          // Authorization header key
-        "shared-secret".to_string(),   // Shared secret
+        "https://cdn.example.com".parse().unwrap(), // Fronting domain (CDN)
+        "api.example.com".to_string(),              // Proxy host
+        "shared-secret".to_string(),                // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -131,7 +129,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = "127.0.0.1:8080".parse()?;
-    let config = server::Config::new(upstream_addr, "X-Auth".to_string(), "shared-secret".to_string());
+    let config = server::Config::new(upstream_addr, "shared-secret".to_string());
     let server = Server::new(config);
 
     // Use with hyper to handle HTTP requests
@@ -151,7 +149,7 @@ The crate includes two example binaries:
 
 ```bash
 cargo run --bin domain_fronting --features examples -- \
-    --front cdn.example.com \
+    --front https://cdn.example.com \
     --host api.example.com \
     --auth "shared-secret"
 ```

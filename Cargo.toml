@@ -20,7 +20,7 @@ async-trait = "0.1"
 bytes = "1.2"
 http = "1.1.0"
 http-body-util = "0.1.2"
-hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
+hyper = { version = "1.8.1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 log = "0.4"
 papaya = "0.2"

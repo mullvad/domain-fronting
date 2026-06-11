@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         url,
     } = Arguments::parse();
 
-    let domain_fronting = DomainFronting::new(front.clone(), host.clone(), auth_key, auth);
+    let domain_fronting =
+        DomainFronting::new(front.clone(), host.clone(), auth).with_auth_key(auth_key);
     let proxy_config = domain_fronting
         .proxy_config()
         .await
@@ -78,9 +79,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_no_client_auth(),
         );
 
-        proxy_config.connect_with_tls(tls_config).await
+        proxy_config.connect_https1_1(tls_config).await
     } else {
-        proxy_config.connect_with_tcp().await
+        proxy_config.connect_http1_1().await
     }
     .context(anyhow!("Failed to connect to {host:?} with front {front}"))?;
 

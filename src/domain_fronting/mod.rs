@@ -38,9 +38,8 @@
 //! use std::sync::Arc;
 //!
 //! let df = DomainFronting::new(
-//!     "cdn.example.com".to_string(),
+//!     "https://cdn.example.com".parse().unwrap(),
 //!     "api.example.com".to_string(),
-//!     "X-Auth".to_string(),
 //!     "password".to_string(),
 //! );
 //!
@@ -56,7 +55,7 @@
 //!         .with_no_client_auth()
 //! );
 //!
-//! let mut client = proxy_config.connect_with_tls(tls_config).await?;
+//! let mut client = proxy_config.connect_https1_1(tls_config).await?;
 //!
 //! // Use like a regular AsyncRead + AsyncWrite stream
 //! client.write_all(b"Hello").await?;
@@ -81,7 +80,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let config = server::Config::new(upstream_addr, "X-Auth".to_string(), "shared-secret".to_string());
+//! let config = server::Config::new(upstream_addr, "shared-secret".to_string());
 //! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
@@ -93,7 +92,7 @@
 //! # Testing
 //!
 //! Both client and server support generic [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
-//! streams for testing. Use [`ProxyConnection::from_stream()`] and
+//! streams for testing. Use [`ProxyConnection::http1_1_from_streams()`] and
 //! [`server::Server::with_connector()`] to inject custom transports like [`tokio::io::duplex`]
 //! for unit tests.
 //!
@@ -147,23 +146,34 @@ pub struct DomainFronting {
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,
     /// HTTP header key used to authorize the proxy request
-    auth_header_key: String,
+    auth_key: String,
     /// HTTP header value used to authorize the proxy request
-    auth_header_val: String,
+    auth_val: String,
+    session_key: String,
 }
 
 impl DomainFronting {
-    pub fn new(
-        front: Uri,
-        proxy_host: String,
-        auth_header_key: String,
-        auth_header_val: String,
-    ) -> Self {
+    pub fn new(front: Uri, proxy_host: String, auth_val: String) -> Self {
         DomainFronting {
             front,
             proxy_host,
-            auth_header_key,
-            auth_header_val,
+            auth_val,
+            auth_key: Self::DEFAULT_AUTH_KEY.into(),
+            session_key: Self::DEFAULT_SESSION_KEY.into(),
+        }
+    }
+
+    pub const DEFAULT_AUTH_KEY: &str = "X-Auth";
+    pub const DEFAULT_SESSION_KEY: &str = "X-Session";
+
+    pub fn with_auth_key(self, auth_key: String) -> Self {
+        Self { auth_key, ..self }
+    }
+
+    pub fn with_session_key(self, session_key: String) -> Self {
+        Self {
+            session_key,
+            ..self
         }
     }
 
@@ -173,7 +183,7 @@ impl DomainFronting {
     }
 
     pub fn front_host(&self) -> &str {
-        &self.front.host().unwrap_or_default()
+        self.front.host().unwrap_or_default()
     }
 
     /// Returns the proxy host (used for Host header).
@@ -182,18 +192,27 @@ impl DomainFronting {
     }
 
     /// Returns the auth header key.
-    pub fn auth_header_key(&self) -> &str {
-        &self.auth_header_key
+    pub fn auth_key(&self) -> &str {
+        &self.auth_key
     }
 
     /// Returns the auth header value.
-    pub fn auth_header_val(&self) -> &str {
-        &self.auth_header_val
+    pub fn auth(&self) -> &str {
+        &self.auth_val
+    }
+
+    pub fn session_key(&self) -> &str {
+        &self.session_key
     }
 
     pub fn tls(&self) -> bool {
         // Assume TLS unless HTTP is specifically requested
         self.front.scheme() != Some(&Scheme::HTTP)
+    }
+
+    /// Get the HTTP scheme in use.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls() { "https" } else { "http" }
     }
 
     pub async fn proxy_config(&self) -> Result<ProxyConfig, Error> {
