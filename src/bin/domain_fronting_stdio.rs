@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::Parser;
 use domain_fronting::DomainFronting;
 use http::Uri;
@@ -30,6 +30,9 @@ pub struct Arguments {
     /// The domain used to hide the actual destination.
     #[arg(long)]
     front: Uri,
+
+    #[arg(long)]
+    http2: bool,
 
     /// The host being reached via `front`.
     #[arg(long)]
@@ -55,9 +58,11 @@ async fn main() -> anyhow::Result<()> {
         front,
         auth_key,
         auth,
+        http2,
     } = Arguments::parse();
 
-    let domain_fronting = DomainFronting::new(front.clone(), host.clone(), auth_key, auth);
+    let domain_fronting =
+        DomainFronting::new(front.clone(), host.clone(), auth).with_auth_key(auth_key);
     let proxy_config = domain_fronting
         .proxy_config()
         .await
@@ -68,15 +73,25 @@ async fn main() -> anyhow::Result<()> {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
 
-        let tls_config = Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
-        proxy_config.connect_with_tls(tls_config).await
+        if http2 {
+            tls_config.alpn_protocols.push(b"h2".to_vec());
+        }
+
+        let tls_config = Arc::new(tls_config);
+
+        if http2 {
+            proxy_config.connect_https2(tls_config).await
+        } else {
+            proxy_config.connect_https1_1(tls_config).await
+        }
+    } else if http2 {
+        bail!("HTTP/2 requires TLS")
     } else {
-        proxy_config.connect_with_tcp().await
+        proxy_config.connect_http1_1().await
     }
     .context(anyhow!("Failed to connect to {host:?} with front {front}"))?;
 

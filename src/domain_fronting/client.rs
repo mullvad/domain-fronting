@@ -19,19 +19,25 @@
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::{io, net::SocketAddr, pin::Pin, task::Poll};
+use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
 
-use futures::{SinkExt, StreamExt, TryFutureExt, TryStreamExt, sink::SinkMapErr, stream};
-use http::header;
-use http_body_util::{BodyDataStream, BodyExt, StreamBody};
-use hyper::body::{Body, Bytes, Frame, Incoming};
-use hyper_util::rt::TokioIo;
+use futures::{
+    SinkExt, TryFutureExt,
+    future::{join, try_join},
+    sink::SinkMapErr,
+};
+use http::{Request, Response, StatusCode, header};
+use http_body_util::{BodyExt, Either, Empty, Full};
+use hyper::{
+    body::{Body, Bytes, Incoming},
+    client::conn::http1,
+};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
     task::AbortHandle,
 };
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{
     io::{CopyToBytes, SinkWriter, StreamReader},
     sync::{PollSendError, PollSender},
@@ -39,6 +45,7 @@ use tokio_util::{
 
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 #[cfg(feature = "tls")]
 use {crate::tls_stream::TlsStream, tokio_rustls::rustls};
@@ -66,9 +73,7 @@ impl ProxyConfig {
         }
     }
 
-    /// Connect to the proxy using a TCP connection with TLS and a custom certificate configuration.
-    ///
-    /// Requires the `tls` feature to be enabled.
+    /// Connect to the proxy with HTTP/2 using a TCP connection with TLS and a custom certificate configuration.
     ///
     /// # Example
     ///
@@ -80,9 +85,8 @@ impl ProxyConfig {
     /// use tokio_rustls::rustls;
     ///
     /// let df = DomainFronting::new(
-    ///     "cdn.example.com".to_string(),
+    ///     "https://cdn.example.com".parse().unwrap(),
     ///     "api.example.com".to_string(),
-    ///     "X-Auth".to_string(),
     ///     "password".to_string(),
     /// );
     ///
@@ -98,30 +102,47 @@ impl ProxyConfig {
     ///         .with_no_client_auth()
     /// );
     ///
-    /// let client = proxy_config.connect_with_tls(tls_config).await?;
+    /// let client = proxy_config.connect_https2(tls_config).await?;
     /// # Ok(())
     /// # }
     /// # fn main() {}
     /// ```
     #[cfg(feature = "tls")]
-    pub async fn connect_with_tls(
+    pub async fn connect_https2(
         &self,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<ProxyConnection, Error> {
         let tcp_stream = TcpStream::connect(self.addr)
             .await
             .map_err(Error::Connection)?;
-        self.connect_stream_with_tls(tcp_stream, tls_config).await
+        self.connect_https2_over_stream(tcp_stream, tls_config)
+            .await
     }
 
-    /// Connect with a custom stream and TLS configuration.
+    /// Connect to the proxy with HTTP/1.1 using two TCP connections with TLS and a custom certificate configuration.
+    ///
+    /// See [`Self::connect_https2`] for an example.
+    #[cfg(feature = "tls")]
+    pub async fn connect_https1_1(
+        &self,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> Result<ProxyConnection, Error> {
+        let tcp_stream1 = TcpStream::connect(self.addr)
+            .await
+            .map_err(Error::Connection)?;
+        let tcp_stream2 = TcpStream::connect(self.addr)
+            .await
+            .map_err(Error::Connection)?;
+        self.connect_https1_1_over_streams(tcp_stream1, tcp_stream2, tls_config)
+            .await
+    }
+
+    /// Connect with HTTP/2 using a custom stream and TLS configuration.
     ///
     /// This allows you to provide your own transport stream (for testing or custom networking)
     /// and your own certificate store and TLS settings.
-    ///
-    /// Requires the `tls` feature to be enabled.
     #[cfg(feature = "tls")]
-    pub async fn connect_stream_with_tls<S>(
+    pub async fn connect_https2_over_stream<S>(
         &self,
         stream: S,
         tls_config: Arc<rustls::ClientConfig>,
@@ -129,41 +150,78 @@ impl ProxyConfig {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        assert!(tls_config.alpn_protocols.contains(&b"h2".to_vec())); // TODO
         let tls =
             TlsStream::connect_with_config(stream, self.domain_fronting.front_host(), tls_config)
                 .await
                 .map_err(Error::Tls)?;
-        ProxyConnection::from_stream(
-            tls,
-            self.domain_fronting.proxy_host(),
-            self.domain_fronting.auth_header_key(),
-            self.domain_fronting.auth_header_val(),
-        )
-        .await
+        ProxyConnection::http2_from_stream(tls, &self.domain_fronting).await
     }
 
-    pub async fn connect_with_tcp(&self) -> Result<ProxyConnection, Error> {
-        let tcp_stream = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
-        self.connect_with_stream(tcp_stream).await
-    }
-
-    /// Connect with a custom stream
+    /// Connect with HTTP/1.1 using a custom stream and TLS configuration.
     ///
-    /// This allows using arbitrary transports like in-memory streams for testing
-    /// or when TLS is handled externally.
-    pub async fn connect_with_stream<S>(&self, stream: S) -> Result<ProxyConnection, Error>
+    /// This allows you to provide your own transport stream (for testing or custom networking)
+    /// and your own certificate store and TLS settings.
+    #[cfg(feature = "tls")]
+    pub async fn connect_https1_1_over_streams<S>(
+        &self,
+        stream1: S,
+        stream2: S,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> Result<ProxyConnection, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        ProxyConnection::from_stream(
-            stream,
-            self.domain_fronting.proxy_host(),
-            self.domain_fronting.auth_header_key(),
-            self.domain_fronting.auth_header_val(),
+        assert!(!tls_config.alpn_protocols.contains(&b"h2".to_vec())); // TODO
+        let tls1 = TlsStream::connect_with_config(
+            stream1,
+            self.domain_fronting.front_host(),
+            Arc::clone(&tls_config),
         )
         .await
+        .map_err(Error::Tls)?;
+        let tls2 =
+            TlsStream::connect_with_config(stream2, self.domain_fronting.front_host(), tls_config)
+                .await
+                .map_err(Error::Tls)?;
+        ProxyConnection::http1_1_from_streams(tls1, tls2, &self.domain_fronting).await
+    }
+
+    pub async fn connect_http1_1(&self) -> Result<ProxyConnection, Error> {
+        let tcp_stream1 = TcpStream::connect(self.addr)
+            .await
+            .map_err(Error::Connection)?;
+        let tcp_stream2 = TcpStream::connect(self.addr)
+            .await
+            .map_err(Error::Connection)?;
+        self.connect_http1_1_over_streams(tcp_stream1, tcp_stream2)
+            .await
+    }
+
+    /// Connect with http/1.1 over a pair of custom streams
+    ///
+    /// This allows using arbitrary transports like in-memory streams for testing
+    /// or when TLS is handled externally.
+    pub async fn connect_http1_1_over_streams<S>(
+        &self,
+        stream1: S,
+        stream2: S,
+    ) -> Result<ProxyConnection, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        ProxyConnection::http1_1_from_streams(stream1, stream2, &self.domain_fronting).await
+    }
+
+    /// Connect with http2 over a custom stream
+    ///
+    /// This allows using arbitrary transports like in-memory streams for testing
+    /// or when TLS is handled externally.
+    pub async fn connect_http2_over_stream<S>(&self, stream: S) -> Result<ProxyConnection, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        ProxyConnection::http2_from_stream(stream, &self.domain_fronting).await
     }
 }
 
@@ -171,41 +229,104 @@ impl ProxyConfig {
 pub type RequestTx =
     SinkWriter<SinkMapErr<CopyToBytes<PollSender<Bytes>>, fn(PollSendError<Bytes>) -> io::Error>>;
 
-/// A mess of types to convert a `Stream<Bytes>` into an [`AsyncRead`].
-pub type ResponseRx =
-    StreamReader<stream::MapErr<BodyDataStream<Incoming>, fn(hyper::Error) -> io::Error>, Bytes>;
-
 pub struct ProxyConnection {
     /// [`AsyncWrite`] for the HTTP request body.
     request_tx: RequestTx,
 
     /// [`AsyncRead`] for the HTTP response body.
-    response_rx: ResponseRx,
+    response_rx: Box<dyn AsyncRead + Unpin>,
 
     /// Abort handle for the connection task
     connection_task: AbortHandle,
+
+    /// Abort handle for the outgoing task
+    pump_task: AbortHandle,
+}
+
+// TODO: name
+type IBody = Either<Empty<Bytes>, Full<Bytes>>;
+
+async fn connect_http1_1(
+    stream: impl AsyncRead + AsyncWrite + Unpin,
+) -> Result<(http1::SendRequest<IBody>, impl Future<Output = impl Send>), Error> {
+    let io = TokioIo::new(stream);
+    let (sender, conn) = http1::handshake::<_, IBody>(io).await?;
+    let conn = conn.inspect_err(|err| log::error!("Domain fronting connection failed: {:?}", err));
+    Ok((sender, conn))
 }
 
 impl ProxyConnection {
-    /// Create a proxy connection from any AsyncRead + AsyncWrite stream.
+    /// Create a proxy connection from any two AsyncRead + AsyncWrite streams.
     ///
-    /// This performs the HTTP handshake over the provided stream.
+    /// This performs an HTTP/1.1 handshake over each provided stream.
     /// Use `ProxyConfig::connect_stream_with_tls` if you need TLS support.
-    pub async fn from_stream<S>(
-        stream: S,
-        proxy_host: &str,
-        auth_header_key: &str,
-        auth_header_val: &str,
+    ///
+    /// One stream is used to streaming data from the proxy to us. The other is used to
+    /// push data from us to the proxy. HTTP1.1 can theoretically support streaming the
+    /// request/response bodies concurrently, but in practice a lot of implementations
+    /// do not support this.
+    pub async fn http1_1_from_streams<S>(
+        stream1: S,
+        stream2: S,
+        config: &DomainFronting,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // For HTTP/1.1, use the two connections. One for reading, and one for writing.
+        let http = try_join(connect_http1_1(stream1), connect_http1_1(stream2)).await?;
+        let ((mut sender1, conn1), (mut sender2, conn2)) = http;
+        let connection_task = tokio::spawn(join(conn1, conn2)).abort_handle();
+
+        Self::start_proxy(
+            connection_task,
+            move |req| sender1.send_request(req),
+            move |req| sender2.send_request(req),
+            config,
+        )
+        .await
+    }
+
+    /// Create a proxy connection from any AsyncRead + AsyncWrite stream.
+    ///
+    /// This performs an HTTP/2 handshake over the provided stream.
+    /// Use `ProxyConfig::connect_stream_with_tls` if you need TLS support.
+    pub async fn http2_from_stream<S>(stream: S, config: &DomainFronting) -> Result<Self, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let io = TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake::<_, _, IBody>(TokioExecutor::new(), io).await?;
         let conn = conn.inspect_err(|err| {
             log::error!("Domain fronting connection failed: {:?}", err);
         });
+
+        // For HTTP/2, use the same connection to do both read and write requests.
         let connection_task = tokio::spawn(conn).abort_handle();
+        let sender = Arc::new(Mutex::new(sender));
+        let (sender1, sender2) = (sender.clone(), sender);
+
+        Self::start_proxy(
+            connection_task,
+            move |req| sender1.lock().unwrap().send_request(req),
+            move |req| sender2.lock().unwrap().send_request(req),
+            config,
+        )
+        .await
+    }
+
+    /// Create a [`ProxyConnection`] and start proxying data.
+    async fn start_proxy<Fut>(
+        connection_task: AbortHandle,
+        mut send_request1: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
+        mut send_request2: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
+        config: &DomainFronting,
+    ) -> Result<Self, Error>
+    where
+        Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
+    {
+        let session_id = Uuid::new_v4();
 
         let (request_tx, request_rx) = mpsc::channel::<Bytes>(1);
 
@@ -214,47 +335,135 @@ impl ProxyConnection {
         let request_tx = request_tx.sink_map_err(io::Error::other as fn(_) -> _);
         let request_tx: RequestTx = SinkWriter::new(request_tx);
 
-        // convert the mpsc::Receiver to a Stream<io::Result<Frame<Bytes>>>
-        let request_rx = ReceiverStream::new(request_rx) // mpsc -> Stream
-            .map(Frame::data)
-            .map(io::Result::Ok);
-        let request_body = StreamBody::new(request_rx);
+        let (response_tx, response_rx) = futures::channel::mpsc::channel::<io::Result<Bytes>>(1);
+        let response_rx = StreamReader::new(response_rx);
 
-        // exchange HTTP headers and get status code & start streaming data in the background
-        let request = create_request(proxy_host, auth_header_key, auth_header_val, request_body);
-        let response = sender.send_request(request).await?;
+        let config = config.clone();
+        let pump = async move {
+            let pump = try_join(
+                Self::pump_incoming(session_id, response_tx, &mut send_request1, &config),
+                Self::pump_outgoing(session_id, request_rx, &mut send_request2, &config),
+            );
+            if let Err(e) = pump.await {
+                log::error!("{e:?}");
+            };
+        };
 
-        if !response.status().is_success() {
-            return Err(Error::HttpStatusCode(response.status()));
-        }
-
-        // convert the response `Incoming` to an `AsyncRead`
-        let response_rx = response
-            .into_body()
-            .into_data_stream()
-            .map_err(io::Error::other as fn(_) -> _);
-        let response_rx: ResponseRx = StreamReader::new(response_rx);
+        let pump_task = tokio::spawn(pump).abort_handle();
 
         Ok(Self {
             request_tx,
-            response_rx,
+            response_rx: Box::new(response_rx),
             connection_task,
+            pump_task,
         })
+    }
+
+    /// Send an HTTP request, and stream the response body into `response_tx`.
+    async fn pump_incoming<F, Fut>(
+        session_id: Uuid,
+        mut response_tx: futures::channel::mpsc::Sender<io::Result<Bytes>>,
+        send_request: &mut F,
+        config: &DomainFronting,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(Request<IBody>) -> Fut + 'static,
+        Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
+    {
+        // exchange HTTP headers and get status code & start streaming data in the background
+        let read_request = create_read_request(config, session_id, Either::Left(Empty::new()));
+
+        let read_response = send_request(read_request).await?;
+        if !read_response.status().is_success() {
+            return Err(Error::HttpStatusCode(read_response.status()));
+        }
+
+        let mut body = read_response.into_body();
+
+        loop {
+            match body.frame().await {
+                None => break,
+                Some(Err(err)) => {
+                    _ = response_tx.send(Err(io::Error::other(err))).await;
+                    break;
+                }
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        if response_tx.send(Ok(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Send [`Bytes`] from `request_tx` to the proxy.
+    async fn pump_outgoing<F, Fut>(
+        session_id: Uuid,
+        mut request_rx: mpsc::Receiver<Bytes>,
+        send_request: &mut F,
+        config: &DomainFronting,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(Request<IBody>) -> Fut + 'static,
+        Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
+    {
+        // Read a chunk of data, wrap it in an HTTP request, and send it off to the proxy.
+        // In theory, we could stream all data in a single request, but some HTTP
+        // reverse-proxies won't forward the request body until the body has been completely
+        // sent off.
+        while let Some(chunk) = request_rx.recv().await {
+            let request_body = Either::Right(Full::new(chunk));
+            let write_request = create_write_request(config, session_id, request_body);
+            let write_response = send_request(write_request).await?;
+            if write_response.status() != StatusCode::NO_CONTENT {
+                return Err(Error::HttpStatusCode(write_response.status()));
+            }
+        }
+        Ok(())
     }
 }
 
-fn create_request<B: Body>(
-    proxy_host: &str,
-    auth_header_key: &str,
-    auth_header_val: &str,
+fn create_write_request<B: Body>(
+    config: &DomainFronting,
+    session_id: Uuid,
     body: B,
 ) -> http::Request<B> {
-    hyper::Request::post(format!("https://{proxy_host}/"))
+    let scheme = config.scheme();
+    let proxy_host = config.proxy_host();
+    // Use a random path in the URI to discourage proxies to cache the request.
+    let uri = format!("{scheme}://{proxy_host}/{}", Uuid::new_v4());
+    hyper::Request::post(uri)
         .header(header::HOST, proxy_host)
-        .header(header::ACCEPT, "*/*")
-        .header(header::CONTENT_TYPE, "application/octet-stream")
+        // Proxies shouldn't cache this request
         .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
-        .header(auth_header_key, auth_header_val)
+        // Stream the request body
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(config.auth_key(), config.auth())
+        .header(config.session_key(), session_id.to_string())
+        .body(body)
+        .unwrap()
+}
+
+fn create_read_request<B: Body>(
+    config: &DomainFronting,
+    session_id: Uuid,
+    body: B,
+) -> http::Request<B> {
+    let scheme = config.scheme();
+    let proxy_host = config.proxy_host();
+    // Use a random path in the URI to discourage proxies to cache the request.
+    let uri = format!("{scheme}://{proxy_host}/{}", Uuid::new_v4());
+    hyper::Request::get(uri)
+        .header(header::HOST, config.proxy_host())
+        // Proxies shouldn't cache this request
+        .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
+        .header(header::ACCEPT, "*/*")
+        .header(config.auth_key(), config.auth())
+        .header(config.session_key(), session_id.to_string())
         .body(body)
         .unwrap()
 }
@@ -311,6 +520,7 @@ impl Drop for ProxyConnection {
         // streams are dropped, but this behavior is not documented anywhere. As such, let's abort
         // the task ourselves anyway.
         self.connection_task.abort();
+        self.pump_task.abort();
     }
 }
 
@@ -359,14 +569,12 @@ mod tests {
         addr
     }
 
-    const AUTH_HEADER: &str = "X-Auth";
     const AUTH: &str = "password";
 
     fn example_df_config() -> DomainFronting {
         DomainFronting::new(
             "example.com".parse().unwrap(),
             "api.example.com".to_string(),
-            AUTH_HEADER.to_string(),
             AUTH.to_string(),
         )
     }
@@ -380,7 +588,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(8192);
 
         // Start proxy server with default TCP connector pointing to echo server
-        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
+        let config = server::Config::new(echo_addr, AUTH.to_string());
         let server = server::Server::new(config);
         let server_clone = server.clone();
 
@@ -392,7 +600,7 @@ mod tests {
                 async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
 
-            let _ = hyper::server::conn::http1::Builder::new()
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .serve_connection(io, service)
                 .await;
         });
@@ -401,7 +609,7 @@ mod tests {
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client = proxy_config
-            .connect_with_stream(client_stream)
+            .connect_http2_over_stream(client_stream)
             .await
             .expect("Failed to create client connection");
 
@@ -449,7 +657,7 @@ mod tests {
         let (client_stream1, server_stream1) = duplex(8192);
         let (client_stream2, server_stream2) = duplex(8192);
 
-        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
+        let config = server::Config::new(echo_addr, AUTH.to_string());
         let server = server::Server::new(config);
 
         // Spawn server for first connection
@@ -460,7 +668,7 @@ mod tests {
                 let server = server_clone1.clone();
                 async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .serve_connection(io, service)
                 .await;
         });
@@ -473,7 +681,7 @@ mod tests {
                 let server = server_clone2.clone();
                 async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .serve_connection(io, service)
                 .await;
         });
@@ -482,12 +690,12 @@ mod tests {
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client1 = proxy_config
-            .connect_with_stream(client_stream1)
+            .connect_http2_over_stream(client_stream1)
             .await
             .expect("Failed to create client1");
 
         let mut client2 = proxy_config
-            .connect_with_stream(client_stream2)
+            .connect_http2_over_stream(client_stream2)
             .await
             .expect("Failed to create client2");
 
@@ -518,7 +726,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(8192);
-        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
+        let config = server::Config::new(echo_addr, AUTH.to_string());
         let server = server::Server::new(config);
         let server_clone = server.clone();
 
@@ -528,7 +736,7 @@ mod tests {
                 let server = server_clone.clone();
                 async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .serve_connection(io, service)
                 .await;
         });
@@ -536,7 +744,7 @@ mod tests {
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let client = proxy_config
-            .connect_with_stream(client_stream)
+            .connect_http2_over_stream(client_stream)
             .await
             .expect("Failed to create client connection");
 
@@ -567,7 +775,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(65536);
-        let config = server::Config::new(echo_addr, AUTH_HEADER.to_string(), AUTH.to_string());
+        let config = server::Config::new(echo_addr, AUTH.to_string());
         let server = server::Server::new(config);
         let server_clone = server.clone();
 
@@ -577,7 +785,7 @@ mod tests {
                 let server = server_clone.clone();
                 async move { Ok::<_, Infallible>(server.handle_request(req).await) }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .serve_connection(io, service)
                 .await;
         });
@@ -585,7 +793,7 @@ mod tests {
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
         let mut client = proxy_config
-            .connect_with_stream(client_stream)
+            .connect_http2_over_stream(client_stream)
             .await
             .expect("Failed to create client");
 
