@@ -19,10 +19,13 @@
 
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fmt::Display,
-    future::Future,
+    future::{Future, pending},
     io,
     net::SocketAddr,
+    ops::DerefMut as _,
+    pin::Pin,
     str::FromStr as _,
     sync::{
         Arc, Mutex, Weak,
@@ -31,13 +34,15 @@ use std::{
     time::Duration,
 };
 
+use anyhow::bail;
 use futures::{Stream, StreamExt, TryStreamExt, stream::abortable};
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Either, Empty, StreamBody};
 use hyper::body::{Body, Bytes, Frame};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, tcp},
+    sync::OwnedMutexGuard,
     time::sleep,
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
@@ -84,6 +89,7 @@ pub struct Server<C: UpstreamConnector = TcpConnector> {
 }
 
 struct Session<C: UpstreamConnector> {
+    upstream_read: Arc<tokio::sync::Mutex<C::Read>>,
     upstream_write: tokio::sync::Mutex<C::Write>,
     ct: CancellationToken,
     session_id: Uuid,
@@ -206,34 +212,51 @@ impl<C: UpstreamConnector> Server<C> {
             return bad_request().map(Either::Left);
         };
 
+        let is_read_request = match head.method {
+            Method::GET => true,
+            Method::POST => false,
+            _ => return bad_request().map(Either::Left),
+        };
+
         let session_id = head
             .headers
             .get(&self.config.session_key)
             .and_then(|s| s.to_str().ok())
             .and_then(|s| Uuid::from_str(s).ok());
-
         let Some(session_id) = session_id else {
             return bad_request().map(Either::Left);
         };
 
-        let session = self
+        // TODO: race condition between creating session, and putting it in the map
+        let existing_session = self
             .sessions
             .lock()
             .unwrap()
             .get(&session_id)
             .and_then(|weak| weak.upgrade());
 
-        if let Some(session) = session {
-            self.handle_existing_session(body, session)
+        let session = match existing_session {
+            Some(existing_session) => existing_session,
+            None => match self.new_session(session_id).await {
+                Ok(new_session) => new_session,
+                Err(e) => {
+                    log::error!("{e}");
+                    return bad_request().map(Either::Left); // failed to create session
+                }
+            },
+        };
+
+        if is_read_request {
+            self.handle_read_request(session).await.map(Either::Right)
+        } else {
+            self.handle_write_request(body, session)
                 .await
                 .map(Either::Left)
-        } else {
-            self.handle_new_session(session_id).await
         }
     }
 
-    /// Forward data from `request_body` to upstream for an existing session.
-    async fn handle_existing_session<E>(
+    /// Stream data from `request_body` to [`Session::upstream_write`].
+    async fn handle_write_request<E>(
         self: Arc<Self>,
         request_body: impl Body<Data = Bytes, Error = E> + Unpin,
         session: Arc<Session<C>>,
@@ -261,12 +284,44 @@ impl<C: UpstreamConnector> Server<C> {
         }
     }
 
-    /// Create a new `session` and start streaming data from upstream in the response body.
-    async fn handle_new_session(
+    /// Stream data from [`Session::upstream_read`] into the response body.
+    async fn handle_read_request(
         self: Arc<Self>,
-        session_id: Uuid,
-    ) -> Response<Either<Empty<Bytes>, StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>>
-    {
+        session: Arc<Session<C>>,
+    ) -> Response<StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>> {
+        struct LockedRead<R>(OwnedMutexGuard<R>);
+
+        impl<R: AsyncRead + Unpin> AsyncRead for LockedRead<R> {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                let inner = self.get_mut().0.deref_mut();
+                let inner = Pin::new(inner);
+                AsyncRead::poll_read(inner, cx, buf)
+            }
+        }
+
+        let session_id = session.session_id.to_string();
+        let upstream_read = LockedRead(session.upstream_read.clone().lock_owned().await);
+
+        // stream data from upstream connection into the HTTP response
+        let response_stream = self.reader_to_http_body(upstream_read, session);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .header(&self.config.session_key, session_id)
+            .body(response_stream)
+            .expect("Response is valid")
+    }
+
+    /// Connect to upstream and crate a new `session`.
+    ///
+    /// Returns `Err` if connection to upstream fails.
+    async fn new_session(self: &Arc<Self>, session_id: Uuid) -> anyhow::Result<Arc<Session<C>>> {
         let ct = CancellationToken::new();
 
         // TODO: implement self.config.idle timeout
@@ -276,51 +331,49 @@ impl<C: UpstreamConnector> Server<C> {
                 sleep(total_timeout).await;
                 ct.cancel();
             }));
+        } else {
+            todo!("a timeout is required, or sessions will live forever");
         }
 
         let connect_fut = self.connector.connect(self.config.upstream);
         let connect_fut = ct.run_until_cancelled(connect_fut);
         let (upstream_read, upstream_write) = match connect_fut.await {
             Some(Ok(conn)) => conn,
-            Some(Err(e)) => {
-                log::error!("Failed to connect to upstream server: {e}");
-                return bad_request().map(Either::Left);
-            }
-            None => {
-                log::error!("Timeout when connecting to upstream server");
-                return bad_request().map(Either::Left);
-            }
+            Some(Err(e)) => bail!("Failed to connect to upstream server: {e}"),
+            None => bail!("Timeout when connecting to upstream server"),
         };
 
         let session = Arc::new(Session {
+            upstream_read: Arc::new(tokio::sync::Mutex::new(upstream_read)),
             upstream_write: tokio::sync::Mutex::new(upstream_write),
             ct: ct.clone(),
-            server: Arc::downgrade(&self),
+            server: Arc::downgrade(self),
             session_id,
         });
+
+        {
+            // Keep session alive until cancelled (e.g. when timeout is reached)
+            let session = Arc::clone(&session);
+            tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
+                let _session = session;
+                pending::<Infallible>().await
+            }));
+        }
+
         self.sessions
             .lock()
             .unwrap()
             .insert(session_id, Arc::downgrade(&session));
 
-        // stream data from upstream connection into the HTTP response
-        let response_stream = self.reader_to_http_body(upstream_read, session);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
-            .header(header::TRANSFER_ENCODING, "chunked")
-            .header(&self.config.session_key, session_id.to_string())
-            .body(Either::Right(response_stream))
-            .expect("Response is valid")
+        Ok(session)
     }
 
     /// Create a stream that reads all bytes from `reader` into an HTTP body.
-    fn reader_to_http_body(
+    fn reader_to_http_body<R: AsyncRead + Unpin + Send + 'static>(
         &self,
-        reader: C::Read,
+        reader: R,
         session: Arc<Session<C>>,
-    ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C>> {
+    ) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>> + use<C, R>> {
         let ct = session.ct.clone();
         let stats = Arc::clone(&self.stats);
         let stream = ReaderStream::new(reader)
