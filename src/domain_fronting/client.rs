@@ -17,7 +17,6 @@
 
 //! Domain fronting client implementation.
 
-#[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
 
@@ -43,7 +42,6 @@ use tokio_util::{
     sync::{PollSendError, PollSender},
 };
 
-#[cfg(feature = "tls")]
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
@@ -234,7 +232,7 @@ pub struct ProxyConnection {
     request_tx: RequestTx,
 
     /// [`AsyncRead`] for the HTTP response body.
-    response_rx: Box<dyn AsyncRead + Unpin>,
+    response_rx: Box<dyn AsyncRead + Unpin + Send>,
 
     /// Abort handle for the connection task
     connection_task: AbortHandle,
@@ -506,6 +504,7 @@ impl AsyncWrite for ProxyConnection {
         cx: &mut std::task::Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        // TODO: consider coalescing the multiple bufs into one HTTP request somehow.
         AsyncWrite::poll_write_vectored(Pin::new(&mut self.request_tx), cx, bufs)
     }
 
