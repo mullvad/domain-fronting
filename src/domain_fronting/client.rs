@@ -23,7 +23,6 @@ use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
 use futures::{
     SinkExt, TryFutureExt,
     future::{join, try_join},
-    sink::SinkMapErr,
 };
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Either, Empty, Full};
@@ -39,7 +38,7 @@ use tokio::{
 };
 use tokio_util::{
     io::{CopyToBytes, SinkWriter, StreamReader},
-    sync::{PollSendError, PollSender},
+    sync::PollSender,
 };
 
 use tokio::net::TcpStream;
@@ -223,13 +222,9 @@ impl ProxyConfig {
     }
 }
 
-/// A mess of types to convert a `Sink<Bytes>` into an [`AsyncWrite`].
-pub type RequestTx =
-    SinkWriter<SinkMapErr<CopyToBytes<PollSender<Bytes>>, fn(PollSendError<Bytes>) -> io::Error>>;
-
 pub struct ProxyConnection {
     /// [`AsyncWrite`] for the HTTP request body.
-    request_tx: RequestTx,
+    request_tx: Box<dyn AsyncWrite + Unpin + Send>,
 
     /// [`AsyncRead`] for the HTTP response body.
     response_rx: Box<dyn AsyncRead + Unpin + Send>,
@@ -330,8 +325,9 @@ impl ProxyConnection {
 
         // convert the mpsc::Sender to an AsyncWrite
         let request_tx = CopyToBytes::new(PollSender::new(request_tx));
-        let request_tx = request_tx.sink_map_err(io::Error::other as _);
-        let request_tx: RequestTx = SinkWriter::new(request_tx);
+        let request_tx = request_tx.sink_map_err(io::Error::other);
+        let request_tx = SinkWriter::new(request_tx);
+        let request_tx = Box::new(request_tx) as Box<dyn AsyncWrite + Unpin + Send>;
 
         let (response_tx, response_rx) = futures::channel::mpsc::channel::<io::Result<Bytes>>(1);
         let response_rx = StreamReader::new(response_rx);
