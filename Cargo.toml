@@ -56,3 +56,7 @@ required-features = ["examples"]
 [[bin]]
 name = "domain_fronting_server"
 required-features = ["examples"]
+
+[[bin]]
+name = "domain_fronting_stdio"
+required-features = ["examples"]
