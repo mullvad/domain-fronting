@@ -24,7 +24,7 @@ use futures::{
     SinkExt, TryFutureExt,
     future::{join, try_join},
 };
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
@@ -406,13 +406,15 @@ impl ProxyConnection {
         // In theory, we could stream all data in a single request, but some HTTP
         // reverse-proxies won't forward the request body until the body has been completely
         // sent off.
+        let mut first = true;
         while let Some(chunk) = request_rx.recv().await {
-            let request_body = Full::new(chunk);
-            let write_request = create_write_request(config, session_id, request_body);
-            let write_response = send_request(write_request).await?;
+            let request_body = Body::new(chunk);
+            let request = create_write_request(config, session_id, request_body, first);
+            let write_response = send_request(request).await?;
             if write_response.status() != StatusCode::NO_CONTENT {
                 return Err(Error::HttpStatusCode(write_response.status()));
             }
+            first = false;
         }
         Ok(())
     }
@@ -422,17 +424,25 @@ fn create_write_request(
     config: &DomainFronting,
     session_id: Uuid,
     body: Body,
+    can_create_session: bool,
 ) -> http::Request<Body> {
     let scheme = config.scheme();
     let proxy_host = config.proxy_host();
+    let method = if can_create_session {
+        Method::POST
+    } else {
+        Method::PATCH
+    };
     // Use a random path in the URI to discourage proxies to cache the request.
     let uri = format!("{scheme}://{proxy_host}/{}", Uuid::new_v4());
-    hyper::Request::post(uri)
+    hyper::Request::builder()
+        .method(method)
+        .uri(uri)
         .header(header::HOST, proxy_host)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(config.session_key(), session_id.to_string())
         .body(body)
-        .unwrap()
+        .expect("Request is valid")
 }
 
 fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Request<Body> {
@@ -445,7 +455,7 @@ fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Reque
         .header(header::ACCEPT, "*/*")
         .header(config.session_key(), session_id.to_string())
         .body(Body::default()) // Empty body
-        .unwrap()
+        .expect("Request is valid")
 }
 
 impl AsyncRead for ProxyConnection {

@@ -36,7 +36,7 @@ use std::{
 use anyhow::{Context, bail};
 use bytes::BytesMut;
 use futures::{Stream, StreamExt, stream};
-use http::{Method, Request, Response, StatusCode, header};
+use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Either, Empty, StreamBody};
 use hyper::body::{Body, Bytes, Frame};
 use kameo::{
@@ -330,11 +330,21 @@ impl<C: UpstreamConnector> Server<C> {
     {
         let (head, body) = request.into_parts();
 
-        let is_read_request = match head.method {
-            Method::GET => true,
-            Method::POST => false,
-            method => bail!("Invalid HTTP method: {method}"),
+        #[derive(PartialEq, Eq)]
+        enum Method {
+            Get,
+            Post,
+            Patch,
+        }
+
+        let method = match head.method {
+            http::Method::GET => Method::Get,
+            http::Method::POST => Method::Post,
+            http::Method::PATCH => Method::Patch,
+            method => bail!("Unexpected HTTP method: {method}"),
         };
+
+        let can_create_session = method != Method::Patch;
 
         let session_id = head
             .headers
@@ -342,25 +352,33 @@ impl<C: UpstreamConnector> Server<C> {
             .and_then(|s| s.to_str().ok())
             .and_then(|s| Uuid::from_str(s).ok());
         let Some(session_id) = session_id else {
-            bail!("Unknown/missing session ID")
+            bail!("Invalid/missing session ID")
         };
 
         let session = {
             let mut sessions = self.sessions.lock().expect("lock poisoned");
             match sessions.entry(session_id) {
-                hash_map::Entry::Occupied(occupied_entry) => {
-                    // TODO
-                    occupied_entry.get().upgrade().context("Expired session")?
+                hash_map::Entry::Occupied(mut entry) => {
+                    if let Some(session) = entry.get().upgrade() {
+                        session
+                    } else if can_create_session {
+                        let session = self.new_session(session_id);
+                        entry.insert(session.downgrade());
+                        session
+                    } else {
+                        bail!("Expired session");
+                    }
                 }
-                hash_map::Entry::Vacant(vacant_entry) => {
+                hash_map::Entry::Vacant(entry) if can_create_session => {
                     let session = self.new_session(session_id);
-                    vacant_entry.insert(session.downgrade());
+                    entry.insert(session.downgrade());
                     session
                 }
+                hash_map::Entry::Vacant(..) => bail!("No session"),
             }
         };
 
-        Ok(if is_read_request {
+        Ok(if let Method::Get = method {
             self.handle_read_request(session).await?.map(Either::Right)
         } else {
             self.handle_write_request(body, session)
