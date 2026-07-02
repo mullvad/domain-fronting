@@ -25,9 +25,9 @@ use futures::{
     future::{join, try_join},
 };
 use http::{Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Either, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    body::{Body, Bytes, Incoming},
+    body::{Bytes, Incoming},
     client::conn::http1,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -236,14 +236,14 @@ pub struct ProxyConnection {
     pump_task: AbortHandle,
 }
 
-// TODO: name
-type IBody = Either<Empty<Bytes>, Full<Bytes>>;
+/// An HTTP body that may contain bytes.
+type Body = Full<Bytes>;
 
 async fn connect_http1_1(
     stream: impl AsyncRead + AsyncWrite + Unpin,
-) -> Result<(http1::SendRequest<IBody>, impl Future<Output = impl Send>), Error> {
+) -> Result<(http1::SendRequest<Body>, impl Future<Output = impl Send>), Error> {
     let io = TokioIo::new(stream);
-    let (sender, conn) = http1::handshake::<_, IBody>(io).await?;
+    let (sender, conn) = http1::handshake::<_, Body>(io).await?;
     let conn = conn.inspect_err(|err| log::error!("Domain fronting connection failed: {:?}", err));
     Ok((sender, conn))
 }
@@ -290,7 +290,7 @@ impl ProxyConnection {
     {
         let io = TokioIo::new(stream);
         let (sender, conn) =
-            hyper::client::conn::http2::handshake::<_, _, IBody>(TokioExecutor::new(), io).await?;
+            hyper::client::conn::http2::handshake::<_, _, Body>(TokioExecutor::new(), io).await?;
         let conn = conn.inspect_err(|err| {
             log::error!("Domain fronting connection failed: {:?}", err);
         });
@@ -298,12 +298,12 @@ impl ProxyConnection {
         // For HTTP/2, use the same connection to do both read and write requests.
         let connection_task = tokio::spawn(conn).abort_handle();
         let sender = Arc::new(Mutex::new(sender));
-        let (sender1, sender2) = (sender.clone(), sender);
+        let (recv_req, send_req) = (sender.clone(), sender);
 
         Self::start_proxy(
             connection_task,
-            move |req| sender1.lock().unwrap().send_request(req),
-            move |req| sender2.lock().unwrap().send_request(req),
+            move |req| recv_req.lock().unwrap().send_request(req),
+            move |req| send_req.lock().unwrap().send_request(req),
             config,
         )
         .await
@@ -312,8 +312,8 @@ impl ProxyConnection {
     /// Create a [`ProxyConnection`] and start proxying data.
     async fn start_proxy<Fut>(
         connection_task: AbortHandle,
-        mut recv_req: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
-        mut send_req: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
+        mut recv_req: impl FnMut(Request<Body>) -> Fut + Send + 'static,
+        mut send_req: impl FnMut(Request<Body>) -> Fut + Send + 'static,
         config: &DomainFronting,
     ) -> Result<Self, Error>
     where
@@ -361,19 +361,18 @@ impl ProxyConnection {
         config: &DomainFronting,
     ) -> Result<(), Error>
     where
-        F: FnMut(Request<IBody>) -> Fut + 'static,
+        F: FnMut(Request<Body>) -> Fut + 'static,
         Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
     {
-        // exchange HTTP headers and get status code & start streaming data in the background
-        let read_request = create_read_request(config, session_id, Either::Left(Empty::new()));
-
+        // exchange HTTP headers and get status code
+        let read_request = create_read_request(config, session_id);
         let read_response = send_request(read_request).await?;
         if !read_response.status().is_success() {
             return Err(Error::HttpStatusCode(read_response.status()));
         }
 
+        // start streaming response data
         let mut body = read_response.into_body();
-
         loop {
             match body.frame().await {
                 None => break,
@@ -401,7 +400,7 @@ impl ProxyConnection {
         config: &DomainFronting,
     ) -> Result<(), Error>
     where
-        F: FnMut(Request<IBody>) -> Fut + 'static,
+        F: FnMut(Request<Body>) -> Fut + 'static,
         Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
     {
         // Read a chunk of data, wrap it in an HTTP request, and send it off to the proxy.
@@ -409,7 +408,7 @@ impl ProxyConnection {
         // reverse-proxies won't forward the request body until the body has been completely
         // sent off.
         while let Some(chunk) = request_rx.recv().await {
-            let request_body = Either::Right(Full::new(chunk));
+            let request_body = Full::new(chunk);
             let write_request = create_write_request(config, session_id, request_body);
             let write_response = send_request(write_request).await?;
             if write_response.status() != StatusCode::NO_CONTENT {
@@ -420,11 +419,11 @@ impl ProxyConnection {
     }
 }
 
-fn create_write_request<B: Body>(
+fn create_write_request(
     config: &DomainFronting,
     session_id: Uuid,
-    body: B,
-) -> http::Request<B> {
+    body: Body,
+) -> http::Request<Body> {
     let scheme = config.scheme();
     let proxy_host = config.proxy_host();
     // Use a random path in the URI to discourage proxies to cache the request.
@@ -442,11 +441,7 @@ fn create_write_request<B: Body>(
         .unwrap()
 }
 
-fn create_read_request<B: Body>(
-    config: &DomainFronting,
-    session_id: Uuid,
-    body: B,
-) -> http::Request<B> {
+fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Request<Body> {
     let scheme = config.scheme();
     let proxy_host = config.proxy_host();
     // Use a random path in the URI to discourage proxies to cache the request.
@@ -458,7 +453,7 @@ fn create_read_request<B: Body>(
         .header(header::ACCEPT, "*/*")
         .header(config.auth_key(), config.auth())
         .header(config.session_key(), session_id.to_string())
-        .body(body)
+        .body(Body::default()) // Empty body
         .unwrap()
 }
 
