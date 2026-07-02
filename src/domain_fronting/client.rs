@@ -330,7 +330,7 @@ impl ProxyConnection {
 
         // convert the mpsc::Sender to an AsyncWrite
         let request_tx = CopyToBytes::new(PollSender::new(request_tx));
-        let request_tx = request_tx.sink_map_err(io::Error::other as fn(_) -> _);
+        let request_tx = request_tx.sink_map_err(io::Error::other as _);
         let request_tx: RequestTx = SinkWriter::new(request_tx);
 
         let (response_tx, response_rx) = futures::channel::mpsc::channel::<io::Result<Bytes>>(1);
