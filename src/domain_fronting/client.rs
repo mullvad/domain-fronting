@@ -273,13 +273,13 @@ impl ProxyConnection {
     {
         // For HTTP/1.1, use the two connections. One for reading, and one for writing.
         let http = try_join(connect_http1_1(stream1), connect_http1_1(stream2)).await?;
-        let ((mut sender1, conn1), (mut sender2, conn2)) = http;
+        let ((mut recv_req, conn1), (mut send_req, conn2)) = http;
         let connection_task = tokio::spawn(join(conn1, conn2)).abort_handle();
 
         Self::start_proxy(
             connection_task,
-            move |req| sender1.send_request(req),
-            move |req| sender2.send_request(req),
+            move |req| recv_req.send_request(req),
+            move |req| send_req.send_request(req),
             config,
         )
         .await
@@ -317,8 +317,8 @@ impl ProxyConnection {
     /// Create a [`ProxyConnection`] and start proxying data.
     async fn start_proxy<Fut>(
         connection_task: AbortHandle,
-        mut send_request1: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
-        mut send_request2: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
+        mut recv_req: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
+        mut send_req: impl FnMut(Request<IBody>) -> Fut + Send + 'static,
         config: &DomainFronting,
     ) -> Result<Self, Error>
     where
@@ -339,8 +339,8 @@ impl ProxyConnection {
         let config = config.clone();
         let pump = async move {
             let pump = try_join(
-                Self::pump_incoming(session_id, response_tx, &mut send_request1, &config),
-                Self::pump_outgoing(session_id, request_rx, &mut send_request2, &config),
+                Self::pump_incoming(session_id, response_tx, &mut recv_req, &config),
+                Self::pump_outgoing(session_id, request_rx, &mut send_req, &config),
             );
             if let Err(e) = pump.await {
                 log::error!("{e:?}");
