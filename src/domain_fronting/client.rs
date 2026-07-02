@@ -430,10 +430,6 @@ fn create_write_request(
     let uri = format!("{scheme}://{proxy_host}/{}", Uuid::new_v4());
     hyper::Request::post(uri)
         .header(header::HOST, proxy_host)
-        // Proxies shouldn't cache this request
-        .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
-        // Stream the request body
-        .header(header::TRANSFER_ENCODING, "chunked")
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(config.auth_key(), config.auth())
         .header(config.session_key(), session_id.to_string())
@@ -448,8 +444,6 @@ fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Reque
     let uri = format!("{scheme}://{proxy_host}/{}", Uuid::new_v4());
     hyper::Request::get(uri)
         .header(header::HOST, config.proxy_host())
-        // Proxies shouldn't cache this request
-        .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
         .header(header::ACCEPT, "*/*")
         .header(config.auth_key(), config.auth())
         .header(config.session_key(), session_id.to_string())
