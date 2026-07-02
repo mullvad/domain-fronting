@@ -105,7 +105,7 @@ struct SessionArgs<C: UpstreamConnector> {
 
 struct Session<C: UpstreamConnector> {
     session_id: Uuid,
-    upstream_read: Arc<tokio::sync::Mutex<C::Read>>,
+    upstream_read: Option<C::Read>,
     upstream_write: C::Write,
     server: Weak<Server<C>>,
     stats: Arc<AtomicStats>,
@@ -126,7 +126,7 @@ impl<C: UpstreamConnector> Actor for Session<C> {
 
         Ok(Session {
             session_id: args.session_id,
-            upstream_read: Arc::new(tokio::sync::Mutex::new(upstream_read)),
+            upstream_read: Some(upstream_read),
             upstream_write,
             server: Arc::downgrade(&args.server),
             stats: args.stats,
@@ -146,9 +146,9 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
         _msg: SessionRead,
         _ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // There can only be one reader at a time.
+        // There can only ever be one reader.
         // If there is another reader, ignore this request
-        let Ok(reader) = self.upstream_read.clone().try_lock_owned() else {
+        let Some(reader) = self.upstream_read.take() else {
             return None;
         };
 
@@ -424,7 +424,7 @@ impl<C: UpstreamConnector> Server<C> {
         let stream = session
             .ask(SessionRead)
             .await?
-            .context("Concurrent reads")?;
+            .context("Multiple read requests are not allowed")?;
         let body = StreamBody::new(stream);
         Ok(Response::builder()
             .status(StatusCode::OK)
