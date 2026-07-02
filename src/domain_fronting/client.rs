@@ -84,7 +84,6 @@ impl ProxyConfig {
     /// let df = DomainFronting::new(
     ///     "https://cdn.example.com".parse().unwrap(),
     ///     "api.example.com".to_string(),
-    ///     "password".to_string(),
     /// );
     ///
     /// let proxy_config = df.proxy_config().await?;
@@ -431,7 +430,6 @@ fn create_write_request(
     hyper::Request::post(uri)
         .header(header::HOST, proxy_host)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(config.auth_key(), config.auth())
         .header(config.session_key(), session_id.to_string())
         .body(body)
         .unwrap()
@@ -445,7 +443,6 @@ fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Reque
     hyper::Request::get(uri)
         .header(header::HOST, config.proxy_host())
         .header(header::ACCEPT, "*/*")
-        .header(config.auth_key(), config.auth())
         .header(config.session_key(), session_id.to_string())
         .body(Body::default()) // Empty body
         .unwrap()
@@ -553,13 +550,10 @@ mod tests {
         addr
     }
 
-    const AUTH: &str = "password";
-
     fn example_df_config() -> DomainFronting {
         DomainFronting::new(
             "example.com".parse().unwrap(),
             "api.example.com".to_string(),
-            AUTH.to_string(),
         )
     }
 
@@ -572,7 +566,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(8192);
 
         // Start proxy server with default TCP connector pointing to echo server
-        let config = server::Config::new(echo_addr, AUTH.to_string());
+        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
         let server_clone = server.clone();
 
@@ -641,7 +635,7 @@ mod tests {
         let (client_stream1, server_stream1) = duplex(8192);
         let (client_stream2, server_stream2) = duplex(8192);
 
-        let config = server::Config::new(echo_addr, AUTH.to_string());
+        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
         // Spawn server for first connection
@@ -710,7 +704,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(8192);
-        let config = server::Config::new(echo_addr, AUTH.to_string());
+        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
         let server_clone = server.clone();
 
@@ -759,7 +753,7 @@ mod tests {
         let echo_addr = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(65536);
-        let config = server::Config::new(echo_addr, AUTH.to_string());
+        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
         let server_clone = server.clone();
 

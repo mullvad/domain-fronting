@@ -37,14 +37,6 @@ pub struct Arguments {
     /// The host being reached via `front`.
     #[arg(long)]
     host: String,
-
-    /// Header key used to authorize against the proxy.
-    #[clap(long, default_value = "X-Auth")]
-    auth_key: String,
-
-    /// Header value used to authorize against the proxy.
-    #[clap(short = 'a', long)]
-    auth: String,
 }
 
 #[tokio::main]
@@ -53,16 +45,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
         .init();
 
-    let Arguments {
-        host,
-        front,
-        auth_key,
-        auth,
-        http2,
-    } = Arguments::parse();
+    let Arguments { host, front, http2 } = Arguments::parse();
 
-    let domain_fronting =
-        DomainFronting::new(front.clone(), host.clone(), auth).with_auth_key(auth_key);
+    let domain_fronting = DomainFronting::new(front.clone(), host.clone());
     let proxy_config = domain_fronting
         .proxy_config()
         .await

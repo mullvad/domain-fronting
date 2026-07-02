@@ -231,10 +231,6 @@ impl<C: UpstreamConnector> std::fmt::Debug for Server<C> {
 pub struct Config {
     /// Address of the upstream host.
     pub upstream: SocketAddr,
-    /// HTTP header key used for the shared secret.
-    pub auth_key: String,
-    /// Shared secret.
-    pub auth: String,
     /// HTTP header key used for the session id.
     pub session_key: String,
     /// Total timeout of one HTTP request.
@@ -244,19 +240,13 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(upstream: SocketAddr, auth: String) -> Self {
+    pub fn new(upstream: SocketAddr) -> Self {
         Self {
             upstream,
-            auth,
-            auth_key: DomainFronting::DEFAULT_AUTH_KEY.into(),
             session_key: DomainFronting::DEFAULT_SESSION_KEY.into(),
             total_timeout: None,
             idle_timeout: None,
         }
-    }
-
-    pub fn with_auth_key(self, auth_key: String) -> Self {
-        Self { auth_key, ..self }
     }
 
     pub fn with_session_key(self, session_key: String) -> Self {
@@ -339,11 +329,6 @@ impl<C: UpstreamConnector> Server<C> {
         E: Error + Display + Send + Sync + 'static,
     {
         let (head, body) = request.into_parts();
-
-        let auth = head.headers.get(&self.config.auth_key);
-        if auth.is_none_or(|value| value != &self.config.auth) {
-            bail!("Invalid auth header: {auth:?}");
-        };
 
         let is_read_request = match head.method {
             Method::GET => true,
@@ -548,8 +533,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stats() {
         let connector = MockConnector::new();
-        let auth = "password";
-        let config = Config::new(dummy_addr(), auth.to_string());
+        let config = Config::new(dummy_addr());
         let server = Server::with_connector(config.clone(), connector);
 
         assert_eq!(server.take_stats(), Stats::default());
@@ -561,7 +545,6 @@ mod tests {
             .handle_request(
                 Request::builder()
                     .method(Method::GET)
-                    .header(&config.auth_key, auth)
                     .header(&config.session_key, session_id.to_string())
                     .body(Empty::new())
                     .unwrap(),
@@ -574,7 +557,6 @@ mod tests {
             .handle_request(
                 Request::builder()
                     .method(Method::POST)
-                    .header(&config.auth_key, auth)
                     .header(&config.session_key, session_id.to_string())
                     .body(Full::new(Bytes::from("hello there")))
                     .unwrap(),
@@ -598,7 +580,6 @@ mod tests {
             .handle_request(
                 Request::builder()
                     .method(Method::GET)
-                    .header(&config.auth_key, auth)
                     .header(&config.session_key, session_id.to_string())
                     .body(Empty::new())
                     .unwrap(),
@@ -611,7 +592,6 @@ mod tests {
             .handle_request(
                 Request::builder()
                     .method(Method::POST)
-                    .header(&config.auth_key, auth)
                     .header(&config.session_key, session_id.to_string())
                     .body(Full::new(Bytes::from("hello again!!!")))
                     .unwrap(),

@@ -150,8 +150,7 @@ The crate includes two example binaries:
 ```bash
 cargo run --bin domain_fronting --features examples -- \
     --front https://cdn.example.com \
-    --host api.example.com \
-    --auth "shared-secret"
+    --host api.example.com
 ```
 
 See also `bin/domain_fronting_stdio.rs`.
@@ -164,8 +163,7 @@ cargo run --bin domain_fronting_server --features examples -- \
     --cert-path /path/to/cert.pem \
     --key-path /path/to/key.pem \
     --upstream 127.0.0.1:8080 \
-    --port 443 \
-    --auth "shared-secret"
+    --port 443
 ```
 
 For plain TCP (no TLS):
@@ -174,8 +172,7 @@ For plain TCP (no TLS):
 cargo run --bin domain_fronting_server --features examples -- \
     --hostname api.example.com \
     --upstream 127.0.0.1:8080 \
-    --port 8080 \
-    --auth "shared-secret"
+    --port 8080
 ```
 
 ## Protocol
@@ -183,9 +180,7 @@ cargo run --bin domain_fronting_server --features examples -- \
 The domain fronting protocol works as follows:
 
 1. Client establishes an HTTP/1.1 connection to the fronting domain (CDN)
-2. Client sends POST requests with:
-   - `Host` header set to the target host
-   - Authorization header (configurable) with a shared secret
+2. Client sends POST requests with `Host` header set to the target host
 3. Server establishes an upstream connection
 4. Server starts streaming data from the request body to upstream, and vice versa
 

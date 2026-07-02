@@ -40,7 +40,6 @@
 //! let df = DomainFronting::new(
 //!     "https://cdn.example.com".parse().unwrap(),
 //!     "api.example.com".to_string(),
-//!     "password".to_string(),
 //! );
 //!
 //! let proxy_config = df.proxy_config().await?;
@@ -80,7 +79,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let config = server::Config::new(upstream_addr, "shared-secret".to_string());
+//! let config = server::Config::new(upstream_addr);
 //! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests
@@ -145,30 +144,19 @@ pub struct DomainFronting {
     front: Uri,
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,
-    /// HTTP header key used to authorize the proxy request
-    auth_key: String,
-    /// HTTP header value used to authorize the proxy request
-    auth_val: String,
     session_key: String,
 }
 
 impl DomainFronting {
-    pub fn new(front: Uri, proxy_host: String, auth_val: String) -> Self {
+    pub fn new(front: Uri, proxy_host: String) -> Self {
         DomainFronting {
             front,
             proxy_host,
-            auth_val,
-            auth_key: Self::DEFAULT_AUTH_KEY.into(),
             session_key: Self::DEFAULT_SESSION_KEY.into(),
         }
     }
 
-    pub const DEFAULT_AUTH_KEY: &str = "X-Auth";
     pub const DEFAULT_SESSION_KEY: &str = "X-Session";
-
-    pub fn with_auth_key(self, auth_key: String) -> Self {
-        Self { auth_key, ..self }
-    }
 
     pub fn with_session_key(self, session_key: String) -> Self {
         Self {
@@ -189,16 +177,6 @@ impl DomainFronting {
     /// Returns the proxy host (used for Host header).
     pub fn proxy_host(&self) -> &str {
         &self.proxy_host
-    }
-
-    /// Returns the auth header key.
-    pub fn auth_key(&self) -> &str {
-        &self.auth_key
-    }
-
-    /// Returns the auth header value.
-    pub fn auth(&self) -> &str {
-        &self.auth_val
     }
 
     pub fn session_key(&self) -> &str {

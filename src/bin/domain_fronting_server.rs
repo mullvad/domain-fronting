@@ -59,14 +59,6 @@ struct Args {
     #[clap(short, long, default_value = "443")]
     port: u16,
 
-    /// Header key used to authorize against the proxy.
-    #[clap(long, default_value = {DomainFronting::DEFAULT_AUTH_KEY})]
-    auth_key: String,
-
-    /// Header value used to authorize against the proxy.
-    #[clap(short = 'a', long)]
-    auth: String,
-
     /// Header key used for the session id.
     #[clap(long, default_value = {DomainFronting::DEFAULT_SESSION_KEY})]
     session_key: String,
@@ -110,8 +102,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key_path,
         upstream,
         port,
-        auth_key,
-        auth,
         session_key,
         total_timeout,
         idle_timeout,
@@ -142,9 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let mut config = Config::new(upstream, auth)
-        .with_auth_key(auth_key)
-        .with_session_key(session_key);
+    let mut config = Config::new(upstream).with_session_key(session_key);
     config.total_timeout = total_timeout.map(Duration::from_secs_f32);
     config.idle_timeout = idle_timeout.map(Duration::from_secs_f32);
     let server = Server::new(config);

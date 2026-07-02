@@ -34,14 +34,6 @@ pub struct Arguments {
     #[arg(long)]
     host: String,
 
-    /// Header key used to authorize against the proxy.
-    #[clap(long, default_value = "X-Auth")]
-    auth_key: String,
-
-    /// Header value used to authorize against `host`.
-    #[clap(short = 'a', long)]
-    auth: String,
-
     /// URL to fetch (defaults to a simple GET request)
     #[clap(short = 'u', long)]
     url: Option<String>,
@@ -53,16 +45,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
         .init();
 
-    let Arguments {
-        front,
-        host,
-        auth_key,
-        auth,
-        url,
-    } = Arguments::parse();
+    let Arguments { front, host, url } = Arguments::parse();
 
-    let domain_fronting =
-        DomainFronting::new(front.clone(), host.clone(), auth).with_auth_key(auth_key);
+    let domain_fronting = DomainFronting::new(front.clone(), host.clone());
     let proxy_config = domain_fronting
         .proxy_config()
         .await
