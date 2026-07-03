@@ -106,7 +106,6 @@
 
 use std::{io, net::SocketAddr};
 
-use crate::util::{deserialize_from_str, serialize_to_string};
 use crate::{DefaultDnsResolver, DnsResolver};
 
 mod client;
@@ -136,11 +135,9 @@ pub enum Error {
 /// Configuration for creating a [`ProxyConfig`].
 ///
 /// Contains the fronting domain, target host, and auth header.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DomainFronting {
     /// Domain that will be used to connect to a CDN.
-    #[serde(serialize_with = "serialize_to_string")]
-    #[serde(deserialize_with = "deserialize_from_str")]
     front: Uri,
     /// Host that will be reached via the CDN, i.e. this is the Host header value
     proxy_host: String,

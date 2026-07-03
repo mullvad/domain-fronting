@@ -51,7 +51,7 @@ use super::{DomainFronting, Error};
 ///
 /// Contains the resolved address and domain fronting configuration.
 /// Created from [`DomainFronting::proxy_config()`].
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub struct ProxyConfig {
     /// The resolved socket address of the CDN.
     pub addr: SocketAddr,

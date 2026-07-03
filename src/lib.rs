@@ -35,7 +35,6 @@ use std::{io, net::IpAddr};
 pub mod domain_fronting;
 #[cfg(feature = "tls")]
 mod tls_stream;
-mod util;
 
 pub use domain_fronting::{DomainFronting, Error, ProxyConfig, ProxyConnection};
 
