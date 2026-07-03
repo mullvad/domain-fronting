@@ -59,9 +59,9 @@ use crate::DomainFronting;
 /// This trait abstracts how upstream connections are created, allowing
 /// injection of test doubles or alternative transports.
 pub trait UpstreamConnector: Clone + Send + Sync + 'static {
-    /// The read-half of the stream roduced by this connector.
+    /// The read-half of the stream produced by this connector.
     type Read: AsyncRead + Unpin + Send + Sync + 'static;
-    /// The write-half of the stream roduced by this connector.
+    /// The write-half of the stream produced by this connector.
     type Write: AsyncWrite + Unpin + Send + Sync + 'static;
 
     /// Connect to the given address.
