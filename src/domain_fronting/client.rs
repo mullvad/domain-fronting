@@ -20,10 +20,7 @@
 use std::sync::Arc;
 use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
 
-use futures::{
-    SinkExt, TryFutureExt,
-    future::{join, try_join},
-};
+use futures::{SinkExt, TryFutureExt, future::try_join};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -31,10 +28,10 @@ use hyper::{
     client::conn::http1,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
-    task::AbortHandle,
 };
 use tokio_util::{
     io::{CopyToBytes, SinkWriter, StreamReader},
@@ -228,11 +225,8 @@ pub struct ProxyConnection {
     /// [`AsyncRead`] for the HTTP response body.
     response_rx: Box<dyn AsyncRead + Unpin + Send>,
 
-    /// Abort handle for the connection task
-    connection_task: AbortHandle,
-
-    /// Abort handle for the outgoing task
-    pump_task: AbortHandle,
+    /// Join handle for the background I/O task.
+    io_task: JoinHandle<Result<(), Error>>,
 }
 
 /// An HTTP body that may contain bytes.
@@ -240,10 +234,15 @@ type Body = Full<Bytes>;
 
 async fn connect_http1_1(
     stream: impl AsyncRead + AsyncWrite + Unpin,
-) -> Result<(http1::SendRequest<Body>, impl Future<Output = impl Send>), Error> {
+) -> Result<
+    (
+        http1::SendRequest<Body>,
+        impl Future<Output = hyper::Result<()>>,
+    ),
+    Error,
+> {
     let io = TokioIo::new(stream);
     let (sender, conn) = http1::handshake::<_, Body>(io).await?;
-    let conn = conn.inspect_err(|err| log::error!("Domain fronting connection failed: {:?}", err));
     Ok((sender, conn))
 }
 
@@ -268,15 +267,14 @@ impl ProxyConnection {
         // For HTTP/1.1, use the two connections. One for reading, and one for writing.
         let http = try_join(connect_http1_1(stream1), connect_http1_1(stream2)).await?;
         let ((mut recv_req, conn1), (mut send_req, conn2)) = http;
-        let connection_task = tokio::spawn(join(conn1, conn2)).abort_handle();
+        let conn = try_join(conn1, conn2).map_ok(|_| ()).map_err(Error::Hyper);
 
         Self::start_proxy(
-            connection_task,
+            conn,
             move |req| recv_req.send_request(req),
             move |req| send_req.send_request(req),
             config,
         )
-        .await
     }
 
     /// Create a proxy connection from any AsyncRead + AsyncWrite stream.
@@ -290,27 +288,24 @@ impl ProxyConnection {
         let io = TokioIo::new(stream);
         let (sender, conn) =
             hyper::client::conn::http2::handshake::<_, _, Body>(TokioExecutor::new(), io).await?;
-        let conn = conn.inspect_err(|err| {
-            log::error!("Domain fronting connection failed: {:?}", err);
-        });
+        let conn = conn.map_err(Error::Hyper);
 
         // For HTTP/2, use the same connection to do both read and write requests.
-        let connection_task = tokio::spawn(conn).abort_handle();
+        // let connection_task = tokio::spawn(conn).abort_handle();
         let sender = Arc::new(Mutex::new(sender));
         let (recv_req, send_req) = (sender.clone(), sender);
 
         Self::start_proxy(
-            connection_task,
+            conn,
             move |req| recv_req.lock().unwrap().send_request(req),
             move |req| send_req.lock().unwrap().send_request(req),
             config,
         )
-        .await
     }
 
     /// Create a [`ProxyConnection`] and start proxying data.
-    async fn start_proxy<Fut>(
-        connection_task: AbortHandle,
+    fn start_proxy<Fut>(
+        conn: impl Future<Output = Result<(), Error>> + Send + 'static,
         mut recv_req: impl FnMut(Request<Body>) -> Fut + Send + 'static,
         mut send_req: impl FnMut(Request<Body>) -> Fut + Send + 'static,
         config: &DomainFronting,
@@ -333,22 +328,20 @@ impl ProxyConnection {
 
         let config = config.clone();
         let pump = async move {
-            let pump = try_join(
+            try_join(
                 Self::pump_incoming(session_id, response_tx, &mut recv_req, &config),
                 Self::pump_outgoing(session_id, request_rx, &mut send_req, &config),
-            );
-            if let Err(e) = pump.await {
-                log::error!("{e:?}");
-            };
+            )
+            .await
         };
 
-        let pump_task = tokio::spawn(pump).abort_handle();
+        let io = try_join(conn, pump).map_ok(|_| ());
+        let io_task = tokio::spawn(io);
 
         Ok(Self {
             request_tx,
             response_rx: Box::new(response_rx),
-            connection_task,
-            pump_task,
+            io_task,
         })
     }
 
@@ -507,11 +500,10 @@ impl AsyncWrite for ProxyConnection {
 
 impl Drop for ProxyConnection {
     fn drop(&mut self) {
-        // Technically the conneciton task will be shut down once the `request_tx` and `response_rx`
+        // Technically the IO task will be shut down once the `request_tx` and `response_rx`
         // streams are dropped, but this behavior is not documented anywhere. As such, let's abort
         // the task ourselves anyway.
-        self.connection_task.abort();
-        self.pump_task.abort();
+        self.io_task.abort();
     }
 }
 
@@ -736,12 +728,12 @@ mod tests {
             .await
             .expect("Failed to create client connection");
 
-        // Grab a handle to the connection task before dropping
-        let connection_task = client.connection_task.clone();
+        // Grab a handle to the I/O task before dropping
+        let io_task = client.io_task.abort_handle();
         // The task should still be running
         assert!(
-            !connection_task.is_finished(),
-            "Connection task should be running before drop"
+            !io_task.is_finished(),
+            "IO task should be running before drop"
         );
 
         // Drop the proxy connection
@@ -750,10 +742,10 @@ mod tests {
         // Give the runtime a moment to process the abort
         tokio::task::yield_now().await;
 
-        // The connection task should now be finished (aborted)
+        // The IO task should now be finished (aborted)
         assert!(
-            connection_task.is_finished(),
-            "Connection task should be stopped after ProxyConnection is dropped"
+            io_task.is_finished(),
+            "IO task should be stopped after ProxyConnection is dropped"
         );
     }
 

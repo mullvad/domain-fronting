@@ -121,8 +121,8 @@ use http::{StatusCode, Uri};
 pub enum Error {
     #[error("Failed to establish TLS connection")]
     Tls(#[source] io::Error),
-    #[error("HTTP handshake failed")]
-    Handshake(#[from] hyper::Error),
+    #[error("Hyper error")]
+    Hyper(#[from] hyper::Error),
     #[error("HTTP request returned {0}")]
     HttpStatusCode(StatusCode),
     #[error("Connection failed")]
