@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
 
+use futures::FutureExt;
 use futures::{SinkExt, TryFutureExt, future::try_join};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
@@ -451,12 +452,26 @@ fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Reque
         .expect("Request is valid")
 }
 
+macro_rules! check_err {
+    ($io_task:expr, $cx:expr) => {
+        match $io_task.poll_unpin($cx)? {
+            Poll::Pending => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(io::Error::other(err))),
+
+            // The I/O task will never exit with Ok(()) unless it's gracefully closed.
+            // It's never gracefully closed unless ProxyConnection is dropped.
+            Poll::Ready(Ok(())) => unreachable!("IO task will not stop while connection lives"),
+        }
+    };
+}
+
 impl AsyncRead for ProxyConnection {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        check_err!(self.io_task, cx);
         AsyncRead::poll_read(Pin::new(&mut self.response_rx), cx, buf)
     }
 }
@@ -467,6 +482,7 @@ impl AsyncWrite for ProxyConnection {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, io::Error>> {
+        check_err!(self.io_task, cx);
         AsyncWrite::poll_write(Pin::new(&mut self.request_tx), cx, buf)
     }
 
@@ -474,6 +490,7 @@ impl AsyncWrite for ProxyConnection {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), io::Error>> {
+        check_err!(self.io_task, cx);
         AsyncWrite::poll_flush(Pin::new(&mut self.request_tx), cx)
     }
 
@@ -481,6 +498,7 @@ impl AsyncWrite for ProxyConnection {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), io::Error>> {
+        check_err!(self.io_task, cx);
         AsyncWrite::poll_shutdown(Pin::new(&mut self.request_tx), cx)
     }
 
@@ -489,6 +507,7 @@ impl AsyncWrite for ProxyConnection {
         cx: &mut std::task::Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        check_err!(self.io_task, cx);
         // TODO: consider coalescing the multiple bufs into one HTTP request somehow.
         AsyncWrite::poll_write_vectored(Pin::new(&mut self.request_tx), cx, bufs)
     }
