@@ -148,9 +148,7 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
     ) -> Self::Reply {
         // There can only ever be one reader.
         // If there is another reader, ignore this request
-        let Some(reader) = self.upstream_read.take() else {
-            return None;
-        };
+        let reader = self.upstream_read.take()?;
 
         struct StreamState<R> {
             reader: R,
