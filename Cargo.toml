@@ -24,10 +24,8 @@ http-body-util = "0.1.2"
 hyper = { version = "1.8.1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 log = "0.4"
-papaya = "0.2"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["net", "io-util", "time", "macros", "sync", "rt-multi-thread", "fs"] }
-tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["io"] }
 uuid = { version = "1.4.1", features = ["v4"] }
 
