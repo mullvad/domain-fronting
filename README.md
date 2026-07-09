@@ -51,7 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
         "https://cdn.example.com".parse().unwrap(), // Fronting domain (CDN)
         "api.example.com".to_string(),              // Proxy host
-        "shared-secret".to_string(),                // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -92,7 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let df = DomainFronting::new(
         "https://cdn.example.com".parse().unwrap(), // Fronting domain (CDN)
         "api.example.com".to_string(),              // Proxy host
-        "shared-secret".to_string(),                // Shared secret
     );
 
     let proxy_config = df.proxy_config().await?;
@@ -129,7 +127,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = "127.0.0.1:8080".parse()?;
-    let config = server::Config::new(upstream_addr, "shared-secret".to_string());
+    let config = server::Config::new(upstream_addr);
     let server = Server::new(config);
 
     // Use with hyper to handle HTTP requests
