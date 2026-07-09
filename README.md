@@ -1,6 +1,6 @@
 # Domain Fronting
 
-A Rust library for domain fronting - tunneling connections through HTTP POST requests to bypass censorship and access restrictions.
+A Rust library for domain fronting - tunneling TCP connections through HTTP POST requests to bypass censorship and access restrictions.
 
 - **Client**: Implements `AsyncRead` + `AsyncWrite` for seamless integration with async code
 - **Server**: HTTP session management with persistent upstream TCP connection per session
@@ -12,7 +12,7 @@ A Rust library for domain fronting - tunneling connections through HTTP POST req
 - `examples`: Enables example binaries (includes `tls`)
 
 ## Building the server
-To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and at least `1.85` version of the rust toolchain.
+To build the server on Ubuntu 22.04 and 24.04, you need to have `build-essential` and `rust` installed.
 ```bash
 sudo apt install rustup build-essential
 rustup default stable
@@ -98,16 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create your TLS config with desired certificate store
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     // Add your certificates...
-    let tls_config = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    );
+    let mut tls_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols.push(b"h2".to_vec()); // Use HTTP2
+    let tls_config = Arc::new(tls_config);
 
     // Connect with a custom transport and TLS config
     let tcp_stream = TcpStream::connect(proxy_config.addr).await?;
     let mut client = proxy_config
-        .connect_stream_with_tls(tcp_stream, tls_config)
+        .connect_http2_over_stream(tcp_stream, tls_config)
         .await?;
 
     client.write_all(b"Hello").await?;
@@ -176,10 +176,7 @@ cargo run --bin domain_fronting_server --features examples -- \
 
 The domain fronting protocol works as follows:
 
-1. Client establishes an HTTP/1.1 connection to the fronting domain (CDN)
-2. Client sends POST requests with `Host` header set to the target host
-3. Server establishes an upstream connection
-4. Server starts streaming data from the request body to upstream, and vice versa
+- TODO
 
 ## License
 
