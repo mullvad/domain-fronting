@@ -168,7 +168,6 @@ For plain TCP (no TLS):
 
 ```bash
 cargo run --bin domain_fronting_server --features examples -- \
-    --hostname api.example.com \
     --upstream 127.0.0.1:8080 \
     --port 8080
 ```
