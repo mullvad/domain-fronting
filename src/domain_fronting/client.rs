@@ -508,12 +508,20 @@ impl AsyncWrite for ProxyConnection {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         check_err!(self.io_task, cx);
-        // TODO: consider coalescing the multiple bufs into one HTTP request somehow.
-        AsyncWrite::poll_write_vectored(Pin::new(&mut self.request_tx), cx, bufs)
+
+        // Merge `bufs` into a single contiguous buffer,
+        // because each `poll_write` will generate one HTTP request.
+        let len: usize = bufs.iter().map(|s| s.len()).sum();
+        let mut contiguous = Vec::with_capacity(len);
+        for buf in bufs {
+            contiguous.extend_from_slice(buf);
+        }
+
+        AsyncWrite::poll_write(Pin::new(&mut self.request_tx), cx, &contiguous)
     }
 
     fn is_write_vectored(&self) -> bool {
-        AsyncWrite::is_write_vectored(&self.request_tx)
+        true
     }
 }
 
