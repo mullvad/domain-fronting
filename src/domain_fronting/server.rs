@@ -47,6 +47,7 @@ use kameo::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, tcp},
+    task::AbortHandle,
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
@@ -101,12 +102,15 @@ struct SessionArgs<C: UpstreamConnector> {
     server: Arc<Server<C>>,
     stats: Arc<AtomicStats>,
     ct: CancellationToken,
+    idle_timeout: Option<Duration>,
 }
 
 struct Session<C: UpstreamConnector> {
     session_id: Uuid,
     upstream_read: Option<C::Read>,
     upstream_write: C::Write,
+    idle_timeout: Option<Duration>,
+    idle_timeout_task: Option<AbortHandle>,
     server: Weak<Server<C>>,
     stats: Arc<AtomicStats>,
     ct: CancellationToken,
@@ -116,7 +120,11 @@ impl<C: UpstreamConnector> Actor for Session<C> {
     type Args = SessionArgs<C>;
     type Error = anyhow::Error;
 
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let idle_timeout_task = args
+            .idle_timeout
+            .map(|idle_timeout| idle_timeout_watchdog(idle_timeout, &actor_ref));
+
         let (upstream_read, upstream_write) = args
             .server
             .connector
@@ -124,14 +132,20 @@ impl<C: UpstreamConnector> Actor for Session<C> {
             .await
             .context("Failed to connect to upstream server")?;
 
-        Ok(Session {
+        let mut session = Session {
             session_id: args.session_id,
             upstream_read: Some(upstream_read),
             upstream_write,
+            idle_timeout: args.idle_timeout,
+            idle_timeout_task,
             server: Arc::downgrade(&args.server),
             stats: args.stats,
             ct: args.ct,
-        })
+        };
+
+        session.pet_idle_watchdog(&actor_ref);
+
+        Ok(session)
     }
 }
 
@@ -144,14 +158,15 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
     async fn handle(
         &mut self,
         _msg: SessionRead,
-        _ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
+        ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // There can only ever be one reader.
-        // If there is another reader, ignore this request
+        // If we get another read request, ignore it
         let reader = self.upstream_read.take()?;
 
-        struct StreamState<R> {
-            reader: R,
+        struct StreamState<C: UpstreamConnector> {
+            reader: C::Read,
+            session: WeakActorRef<Session<C>>,
             buf: BytesMut,
             stats: Arc<AtomicStats>,
             ct: CancellationToken,
@@ -159,6 +174,7 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
 
         let state = StreamState {
             reader,
+            session: ctx.actor_ref().downgrade(),
             buf: BytesMut::new(),
             stats: self.stats.clone(),
             ct: self.ct.clone(),
@@ -178,6 +194,10 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
 
             let n = bytes.len() as u64;
             state.stats.bytes_rx.fetch_add(n, Ordering::Relaxed);
+
+            if let Some(session) = state.session.upgrade() {
+                let _ = session.tell(SessionPetWatchdog).await;
+            }
 
             let frame = io::Result::Ok(Frame::data(bytes));
 
@@ -202,8 +222,49 @@ impl<C: UpstreamConnector> Message<SessionWrite> for Session<C> {
         if let Err(e) = self.upstream_write.write_all(&bytes).await {
             log::debug!("Failed to write data to upstream: {e:?}");
             ctx.stop();
+        } else {
+            let _ = ctx.actor_ref().tell(SessionPetWatchdog).await;
         }
     }
+}
+
+struct SessionPetWatchdog;
+
+impl<C: UpstreamConnector> Message<SessionPetWatchdog> for Session<C> {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: SessionPetWatchdog,
+        ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.pet_idle_watchdog(ctx.actor_ref());
+    }
+}
+
+impl<C: UpstreamConnector> Session<C> {
+    fn pet_idle_watchdog(&mut self, actor_ref: &ActorRef<Self>) {
+        if let Some(task) = self.idle_timeout_task.take() {
+            task.abort();
+        }
+
+        self.idle_timeout_task = self
+            .idle_timeout
+            .map(|idle_timeout| idle_timeout_watchdog(idle_timeout, actor_ref));
+    }
+}
+
+fn idle_timeout_watchdog<C: UpstreamConnector>(
+    idle_timeout: Duration,
+    actor_ref: &ActorRef<Session<C>>,
+) -> AbortHandle {
+    let actor_ref = actor_ref.clone();
+    tokio::spawn(async move {
+        sleep(idle_timeout).await;
+        log::debug!("Idle session timed out");
+        actor_ref.kill();
+    })
+    .abort_handle()
 }
 
 impl<C: UpstreamConnector> Drop for Session<C> {
@@ -250,6 +311,20 @@ impl Config {
     pub fn with_session_key(self, session_key: String) -> Self {
         Self {
             session_key,
+            ..self
+        }
+    }
+
+    pub fn with_total_timeout(self, total_timeout: Duration) -> Self {
+        Self {
+            total_timeout: Some(total_timeout),
+            ..self
+        }
+    }
+
+    pub fn with_idle_timeout(self, idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout: Some(idle_timeout),
             ..self
         }
     }
@@ -443,12 +518,9 @@ impl<C: UpstreamConnector> Server<C> {
             let ct = ct.clone();
             tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
                 sleep(total_timeout).await;
+                log::debug!("Session timed out");
                 ct.cancel();
             }));
-        }
-
-        if let Some(_idle_timeout) = self.config.idle_timeout {
-            todo!("idle_timeout");
         }
 
         let session = Session::spawn(SessionArgs {
@@ -457,6 +529,7 @@ impl<C: UpstreamConnector> Server<C> {
             server: Arc::clone(self),
             stats: Arc::clone(&self.stats),
             ct: ct.clone(),
+            idle_timeout: self.config.idle_timeout,
         });
 
         {
@@ -505,21 +578,19 @@ impl AtomicStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use http::Method;
     use http_body_util::Full;
-    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
+    use tokio::{
+        io::{DuplexStream, ReadHalf, SimplexStream, WriteHalf, split},
+        task::yield_now,
+    };
 
-    /// Mock connector that just echoes incoming data.
+    /// Mock connector that echoes the first incoming chunk and then exits.
     #[derive(Clone)]
-    struct MockConnector {}
+    struct EchoConnector;
 
-    impl MockConnector {
-        fn new() -> Self {
-            Self {}
-        }
-    }
-
-    impl UpstreamConnector for MockConnector {
+    impl UpstreamConnector for EchoConnector {
         type Read = ReadHalf<DuplexStream>;
         type Write = WriteHalf<DuplexStream>;
 
@@ -541,43 +612,194 @@ mod tests {
         }
     }
 
+    /// Mock connector that drops all written data.
+    #[derive(Clone)]
+    struct NullConnector;
+
+    impl UpstreamConnector for NullConnector {
+        type Read = ReadHalf<SimplexStream>;
+        type Write = tokio::io::Empty;
+
+        async fn connect(&self, _addr: SocketAddr) -> io::Result<(Self::Read, Self::Write)> {
+            let (local, remote) = tokio::io::simplex(1);
+
+            // Leak the remote end to make calls to `read` wait forever
+            Box::leak(Box::new(remote));
+
+            Ok((local, tokio::io::empty()))
+        }
+    }
+
+    /// Mock connector that always has data to read.
+    #[derive(Clone)]
+    struct SpamConnector;
+
+    impl UpstreamConnector for SpamConnector {
+        type Read = ReadHalf<SimplexStream>;
+        type Write = tokio::io::Empty;
+
+        async fn connect(&self, _addr: SocketAddr) -> io::Result<(Self::Read, Self::Write)> {
+            let chunk = b"hello there!";
+            let (local, mut remote) = tokio::io::simplex(chunk.len());
+
+            // Spawn a task to write data on the upstream side
+            tokio::spawn(async move {
+                loop {
+                    // Spam data
+                    if remote.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+
+            Ok((local, tokio::io::empty()))
+        }
+    }
+
     fn dummy_addr() -> SocketAddr {
         "127.0.0.1:1234".parse().unwrap()
+    }
+
+    async fn get<C: UpstreamConnector>(
+        server: &Arc<Server<C>>,
+        config: &Config,
+        session: Uuid,
+    ) -> Either<Empty<Bytes>, StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>> {
+        eprintln!("sending get request");
+        server
+            .clone()
+            .handle_request(
+                Request::builder()
+                    .method(Method::GET)
+                    .header(&config.session_key, session.to_string())
+                    .body(Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .into_body()
+    }
+
+    async fn post<C: UpstreamConnector>(
+        server: &Arc<Server<C>>,
+        config: &Config,
+        session: Uuid,
+        bytes: impl AsRef<[u8]>,
+    ) -> Response<impl Body> {
+        let bytes = bytes.as_ref().to_vec();
+        eprintln!("sending post request with {} bytes", bytes.len());
+        server
+            .clone()
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .header(&config.session_key, session.to_string())
+                    .body(Full::new(Bytes::from(bytes)))
+                    .unwrap(),
+            )
+            .await
+    }
+
+    /// Test that idle-timeout works, and that writing to a session keeps it alive
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_write() {
+        // create a server with an idle-timeout of 3 seconds
+        let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
+        let server = Server::with_connector(config.clone(), NullConnector);
+
+        let wait = async |seconds| {
+            // yield a bunch to make sure that background tasks have been polled
+            yield_now().await;
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+            yield_now().await;
+        };
+
+        for stalls in [0, 1, 2, 99] {
+            let session = Uuid::new_v4();
+            let mut reader = get(&server, &config, session).await;
+            yield_now().await;
+
+            let mut session_must_be_alive = || {
+                let None = reader.frame().now_or_never() else {
+                    panic!("Stream should still be alive")
+                };
+            };
+
+            session_must_be_alive();
+            wait(2).await;
+            session_must_be_alive();
+
+            // keep the session alive by writing data every 2 seconds
+            for _ in 0..stalls {
+                post(&server, &config, session, "stay alive!").await;
+
+                wait(2).await;
+                session_must_be_alive();
+            }
+
+            // trigger a timeout by waiting for more than 3 seconds
+            wait(4).await;
+
+            let Some(None) = reader.frame().now_or_never() else {
+                panic!("Stream must have ended after idle timeout")
+            };
+        }
+    }
+
+    /// Test that idle-timeout works, and that reading from a session keeps it alive
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_read() {
+        // create a server with an idle-timeout of 3 seconds
+        let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
+        let server = Server::with_connector(config.clone(), SpamConnector);
+
+        let wait = async |seconds| {
+            // yield a bunch to make sure that background tasks have been polled
+            yield_now().await;
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+            yield_now().await;
+        };
+
+        for stalls in [0, 1, 2, 99] {
+            let session = Uuid::new_v4();
+            let mut reader = get(&server, &config, session).await;
+            yield_now().await;
+
+            let mut session_must_be_alive = || {
+                let Some(Some(Ok(_frame))) = dbg!(reader.frame().now_or_never()) else {
+                    panic!("Stream should still be alive")
+                };
+            };
+
+            session_must_be_alive();
+
+            // keep the session alive by reading data every 2 seconds
+            for _ in 0..stalls {
+                wait(2).await;
+                session_must_be_alive();
+            }
+
+            // trigger a timeout by waiting for more than 3 seconds
+            wait(4).await;
+
+            let None = dbg!(reader.frame().await) else {
+                panic!("Stream must have ended after idle timeout")
+            };
+        }
     }
 
     /// Verify that we can send and receive data, and that `take_stats` returns the correct values.
     #[tokio::test(start_paused = true)]
     async fn stats() {
-        let connector = MockConnector::new();
         let config = Config::new(dummy_addr());
-        let server = Server::with_connector(config.clone(), connector);
+        let server = Server::with_connector(config.clone(), EchoConnector);
 
         assert_eq!(server.take_stats(), Stats::default());
 
         // Proxied data should increment stats counter
-        let session_id = Uuid::new_v4();
-        let reader = server
-            .clone()
-            .handle_request(
-                Request::builder()
-                    .method(Method::GET)
-                    .header(&config.session_key, session_id.to_string())
-                    .body(Empty::new())
-                    .unwrap(),
-            )
-            .await
-            .into_body();
+        let session = Uuid::new_v4();
+        let reader = get(&server, &config, session).await;
         assert!(!reader.is_end_stream());
-        let write_response = server
-            .clone()
-            .handle_request(
-                Request::builder()
-                    .method(Method::POST)
-                    .header(&config.session_key, session_id.to_string())
-                    .body(Full::new(Bytes::from("hello there")))
-                    .unwrap(),
-            )
-            .await;
+        let write_response = post(&server, &config, session, "hello there").await;
         assert_eq!(write_response.status(), StatusCode::NO_CONTENT);
         let body = reader.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 26);
@@ -590,29 +812,10 @@ mod tests {
         assert_eq!(stats, Default::default());
 
         // Proxied data should increment stats counter again
-        let session_id = Uuid::new_v4();
-        let reader = server
-            .clone()
-            .handle_request(
-                Request::builder()
-                    .method(Method::GET)
-                    .header(&config.session_key, session_id.to_string())
-                    .body(Empty::new())
-                    .unwrap(),
-            )
-            .await
-            .into_body();
+        let session = Uuid::new_v4();
+        let reader = get(&server, &config, session).await;
         assert!(!reader.is_end_stream());
-        let write_response = server
-            .clone()
-            .handle_request(
-                Request::builder()
-                    .method(Method::POST)
-                    .header(&config.session_key, session_id.to_string())
-                    .body(Full::new(Bytes::from("hello again!!!")))
-                    .unwrap(),
-            )
-            .await;
+        let write_response = post(&server, &config, session, "hello again!!!").await;
         assert_eq!(write_response.status(), StatusCode::NO_CONTENT);
         let body = reader.collect().await.unwrap();
         assert_eq!(body.to_bytes().len(), 29);

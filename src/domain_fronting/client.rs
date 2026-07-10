@@ -537,7 +537,7 @@ impl Drop for ProxyConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain_fronting::server;
+    use crate::domain_fronting::server::{self, Server};
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
     use tokio::{
@@ -579,6 +579,22 @@ mod tests {
         addr
     }
 
+    fn serve_requests(
+        io: impl AsyncWrite + AsyncRead + Unpin + Send + 'static,
+        server: Arc<Server>,
+    ) {
+        tokio::spawn(async move {
+            let io = TokioIo::new(io);
+            let service = hyper::service::service_fn(move |req| {
+                let server = server.clone();
+                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+    }
+
     fn example_df_config() -> DomainFronting {
         DomainFronting::new(
             "example.com".parse().unwrap(),
@@ -597,20 +613,9 @@ mod tests {
         // Start proxy server with default TCP connector pointing to echo server
         let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
-        let server_clone = server.clone();
 
-        // Spawn HTTP server on server_stream
-        tokio::spawn(async move {
-            let io = TokioIo::new(server_stream);
-            let service = hyper::service::service_fn(move |req| {
-                let server = server_clone.clone();
-                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
-            });
-
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
-        });
+        // Spawn a task to serve requests
+        serve_requests(server_stream, server.clone());
 
         // Create client connection using the in-memory stream (no TLS)
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
@@ -667,31 +672,9 @@ mod tests {
         let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
-        // Spawn server for first connection
-        let server_clone1 = server.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(server_stream1);
-            let service = hyper::service::service_fn(move |req| {
-                let server = server_clone1.clone();
-                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
-            });
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
-        });
-
-        // Spawn server for second connection
-        let server_clone2 = server.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(server_stream2);
-            let service = hyper::service::service_fn(move |req| {
-                let server = server_clone2.clone();
-                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
-            });
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
-        });
+        // Spawn tasks to serve requests
+        serve_requests(server_stream1, server.clone());
+        serve_requests(server_stream2, server.clone());
 
         // Create two client connections
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
@@ -735,18 +718,9 @@ mod tests {
         let (client_stream, server_stream) = duplex(8192);
         let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
-        let server_clone = server.clone();
 
-        tokio::spawn(async move {
-            let io = TokioIo::new(server_stream);
-            let service = hyper::service::service_fn(move |req| {
-                let server = server_clone.clone();
-                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
-            });
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
-        });
+        // Spawn a task to serve requests
+        serve_requests(server_stream, server.clone());
 
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
@@ -764,7 +738,8 @@ mod tests {
         );
 
         // Drop the proxy connection
-        drop(client);
+        drop(client);tatus(), StatusCode::NO_CONTENT);
+        let body = reader.collect().
 
         // Give the runtime a moment to process the abort
         tokio::task::yield_now().await;
@@ -784,18 +759,9 @@ mod tests {
         let (client_stream, server_stream) = duplex(65536);
         let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
-        let server_clone = server.clone();
 
-        tokio::spawn(async move {
-            let io = TokioIo::new(server_stream);
-            let service = hyper::service::service_fn(move |req| {
-                let server = server_clone.clone();
-                async move { Ok::<_, Infallible>(server.handle_request(req).await) }
-            });
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await;
-        });
+        // Spawn a task to serve requests
+        serve_requests(server_stream, server.clone());
 
         let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
