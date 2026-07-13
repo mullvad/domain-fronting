@@ -42,7 +42,6 @@ kameo = "0.22.1"
 tokio = { version = "1.42", features = ["test-util", "time"] }
 
 [features]
-# default = ["examples"]
 tls = ["rustls", "rustls-pki-types", "tokio-rustls"]
 examples = ["clap", "tracing-subscriber", "tls", "tokio/io-std", "webpki-roots"]
 
