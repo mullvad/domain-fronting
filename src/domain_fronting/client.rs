@@ -738,8 +738,7 @@ mod tests {
         );
 
         // Drop the proxy connection
-        drop(client);tatus(), StatusCode::NO_CONTENT);
-        let body = reader.collect().
+        drop(client);
 
         // Give the runtime a moment to process the abort
         tokio::task::yield_now().await;
