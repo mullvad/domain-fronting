@@ -41,7 +41,7 @@ use http_body_util::{BodyExt, Either, Empty, StreamBody};
 use hyper::body::{Body, Bytes, Frame};
 use kameo::{
     Actor,
-    actor::{ActorRef, WeakActorRef},
+    actor::{ActorRef, Spawn as _, WeakActorRef},
     prelude::Message,
 };
 use tokio::{
@@ -50,7 +50,6 @@ use tokio::{
     task::AbortHandle,
     time::sleep,
 };
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::DomainFronting;
@@ -90,7 +89,7 @@ pub struct Server<C: UpstreamConnector = TcpConnector> {
     config: Config,
     connector: C,
     stats: Arc<AtomicStats>,
-    sessions: Mutex<HashMap<Uuid, WeakActorRef<Session<C>>>>,
+    sessions: Mutex<HashMap<Uuid, ActorRef<Session<C>>>>,
 }
 
 /// A boxed trait object for a [`Stream`] of bytes.
@@ -101,49 +100,59 @@ struct SessionArgs<C: UpstreamConnector> {
     upstream: SocketAddr,
     server: Arc<Server<C>>,
     stats: Arc<AtomicStats>,
-    ct: CancellationToken,
     idle_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
 }
 
 struct Session<C: UpstreamConnector> {
     session_id: Uuid,
-    upstream_read: Option<C::Read>,
     upstream_write: C::Write,
+    upstream_read: Option<C::Read>,
+    upstream_read_abort: Option<stream::AbortHandle>,
     idle_timeout: Option<Duration>,
     idle_timeout_task: Option<AbortHandle>,
+    total_timeout_task: Option<AbortHandle>,
     server: Weak<Server<C>>,
     stats: Arc<AtomicStats>,
-    ct: CancellationToken,
 }
 
 impl<C: UpstreamConnector> Actor for Session<C> {
     type Args = SessionArgs<C>;
     type Error = anyhow::Error;
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let idle_timeout_task = args
-            .idle_timeout
-            .map(|idle_timeout| idle_timeout_watchdog(idle_timeout, &actor_ref));
+    async fn on_start(
+        Self::Args {
+            session_id,
+            upstream,
+            server,
+            stats,
+            idle_timeout,
+            total_timeout,
+        }: Self::Args,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        let total_timeout_task = total_timeout.map(|timeout| actor_timeout(&actor_ref, timeout));
+        let idle_timeout_task = idle_timeout.map(|timeout| actor_timeout(&actor_ref, timeout));
 
-        let (upstream_read, upstream_write) = args
-            .server
+        let (upstream_read, upstream_write) = server
             .connector
-            .connect(args.upstream)
+            .connect(upstream)
             .await
             .context("Failed to connect to upstream server")?;
 
         let mut session = Session {
-            session_id: args.session_id,
-            upstream_read: Some(upstream_read),
+            session_id,
             upstream_write,
-            idle_timeout: args.idle_timeout,
+            upstream_read: Some(upstream_read),
+            upstream_read_abort: None,
+            idle_timeout,
             idle_timeout_task,
-            server: Arc::downgrade(&args.server),
-            stats: args.stats,
-            ct: args.ct,
+            total_timeout_task,
+            server: Arc::downgrade(&server),
+            stats,
         };
 
-        session.pet_idle_watchdog(&actor_ref);
+        session.reset_idle_timeout(&actor_ref);
 
         Ok(session)
     }
@@ -169,7 +178,6 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
             session: WeakActorRef<Session<C>>,
             buf: BytesMut,
             stats: Arc<AtomicStats>,
-            ct: CancellationToken,
         }
 
         let state = StreamState {
@@ -177,8 +185,13 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
             session: ctx.actor_ref().downgrade(),
             buf: BytesMut::new(),
             stats: self.stats.clone(),
-            ct: self.ct.clone(),
         };
+
+        impl<C: UpstreamConnector> Drop for StreamState<C> {
+            fn drop(&mut self) {
+                self.session.kill();
+            }
+        }
 
         let stream = stream::unfold(state, |mut state| async move {
             debug_assert!(state.buf.is_empty());
@@ -186,9 +199,8 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
                 state.buf.reserve(4096);
             }
 
-            let read = state.reader.read_buf(&mut state.buf);
-            let bytes = match state.ct.run_until_cancelled(read).await {
-                Some(Ok(1..)) => state.buf.split().freeze(),
+            let bytes = match state.reader.read_buf(&mut state.buf).await {
+                Ok(1..) => state.buf.split().freeze(),
                 _ => return None,
             };
 
@@ -196,13 +208,16 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
             state.stats.bytes_rx.fetch_add(n, Ordering::Relaxed);
 
             if let Some(session) = state.session.upgrade() {
-                let _ = session.tell(SessionPetWatchdog).await;
+                let _ = session.tell(SessionResetIdleTimeout).await;
             }
 
             let frame = io::Result::Ok(Frame::data(bytes));
 
             Some((frame, state))
         });
+
+        let (stream, handle) = stream::abortable(stream);
+        self.upstream_read_abort = Some(handle);
 
         Some(stream.boxed())
     }
@@ -223,45 +238,43 @@ impl<C: UpstreamConnector> Message<SessionWrite> for Session<C> {
             log::debug!("Failed to write data to upstream: {e:?}");
             ctx.stop();
         } else {
-            let _ = ctx.actor_ref().tell(SessionPetWatchdog).await;
+            let _ = ctx.actor_ref().tell(SessionResetIdleTimeout).try_send();
         }
     }
 }
 
-struct SessionPetWatchdog;
+struct SessionResetIdleTimeout;
 
-impl<C: UpstreamConnector> Message<SessionPetWatchdog> for Session<C> {
+impl<C: UpstreamConnector> Message<SessionResetIdleTimeout> for Session<C> {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        _: SessionPetWatchdog,
+        _: SessionResetIdleTimeout,
         ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.pet_idle_watchdog(ctx.actor_ref());
+        self.reset_idle_timeout(ctx.actor_ref());
     }
 }
 
 impl<C: UpstreamConnector> Session<C> {
-    fn pet_idle_watchdog(&mut self, actor_ref: &ActorRef<Self>) {
+    fn reset_idle_timeout(&mut self, actor_ref: &ActorRef<Self>) {
         if let Some(task) = self.idle_timeout_task.take() {
             task.abort();
         }
 
         self.idle_timeout_task = self
             .idle_timeout
-            .map(|idle_timeout| idle_timeout_watchdog(idle_timeout, actor_ref));
+            .map(|idle_timeout| actor_timeout(actor_ref, idle_timeout));
     }
 }
 
-fn idle_timeout_watchdog<C: UpstreamConnector>(
-    idle_timeout: Duration,
-    actor_ref: &ActorRef<Session<C>>,
-) -> AbortHandle {
+/// Spawn a task that calls [`ActorRef::kill`] after `after` time has passed.
+fn actor_timeout(actor_ref: &ActorRef<impl Actor>, after: Duration) -> AbortHandle {
     let actor_ref = actor_ref.clone();
     tokio::spawn(async move {
-        sleep(idle_timeout).await;
-        log::debug!("Idle session timed out");
+        sleep(after).await;
+        log::debug!("Session timed out");
         actor_ref.kill();
     })
     .abort_handle()
@@ -269,7 +282,15 @@ fn idle_timeout_watchdog<C: UpstreamConnector>(
 
 impl<C: UpstreamConnector> Drop for Session<C> {
     fn drop(&mut self) {
-        self.ct.cancel();
+        if let Some(task) = self.total_timeout_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.idle_timeout_task.take() {
+            task.abort();
+        }
+        if let Some(stream) = self.upstream_read_abort.take() {
+            stream.abort();
+        }
         if let Some(server) = self.server.upgrade() {
             let mut sessions = server.sessions.lock().expect("lock poisoned");
             sessions.remove(&self.session_id);
@@ -432,20 +453,17 @@ impl<C: UpstreamConnector> Server<C> {
             let mut sessions = self.sessions.lock().expect("lock poisoned");
             match sessions.entry(session_id) {
                 hash_map::Entry::Occupied(mut entry) => {
-                    if let Some(session) = entry.get().upgrade() {
-                        session
+                    let session = entry.get();
+                    if session.is_alive() {
+                        session.clone()
                     } else if can_create_session {
-                        let session = self.new_session(session_id);
-                        entry.insert(session.downgrade());
-                        session
+                        entry.insert(self.new_session(session_id)).clone()
                     } else {
                         bail!("Expired session");
                     }
                 }
                 hash_map::Entry::Vacant(entry) if can_create_session => {
-                    let session = self.new_session(session_id);
-                    entry.insert(session.downgrade());
-                    session
+                    entry.insert(self.new_session(session_id)).clone()
                 }
                 hash_map::Entry::Vacant(..) => bail!("No session"),
             }
@@ -481,7 +499,7 @@ impl<C: UpstreamConnector> Server<C> {
         }
 
         Ok(match total {
-            0 => bad_request(),
+            0 => bail!("Empty body"),
             1.. => Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(Empty::new())
@@ -512,36 +530,14 @@ impl<C: UpstreamConnector> Server<C> {
     ///
     /// Returns `Err` if connection to upstream fails.
     fn new_session(self: &Arc<Self>, session_id: Uuid) -> ActorRef<Session<C>> {
-        let ct = CancellationToken::new();
-
-        if let Some(total_timeout) = self.config.total_timeout {
-            let ct = ct.clone();
-            tokio::spawn(ct.clone().run_until_cancelled_owned(async move {
-                sleep(total_timeout).await;
-                log::debug!("Session timed out");
-                ct.cancel();
-            }));
-        }
-
-        let session = Session::spawn(SessionArgs {
+        Session::spawn(SessionArgs {
             session_id,
             upstream: self.config.upstream,
             server: Arc::clone(self),
             stats: Arc::clone(&self.stats),
-            ct: ct.clone(),
             idle_timeout: self.config.idle_timeout,
-        });
-
-        {
-            // Keep session alive until cancelled (e.g. when timeout is reached)
-            let session = ActorRef::clone(&session);
-            tokio::spawn(async move {
-                ct.cancelled().await;
-                session.kill();
-            });
-        }
-
-        session
+            total_timeout: self.config.total_timeout,
+        })
     }
 
     pub fn take_stats(&self) -> Stats {
@@ -699,19 +695,20 @@ mod tests {
             .await
     }
 
+    /// Advance the tokio time by `seconds`
+    async fn wait(seconds: u64) {
+        // yield a bunch to make sure that background tasks have been polled
+        yield_now().await;
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        yield_now().await;
+    }
+
     /// Test that idle-timeout works, and that writing to a session keeps it alive
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_write() {
         // create a server with an idle-timeout of 3 seconds
         let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
         let server = Server::with_connector(config.clone(), NullConnector);
-
-        let wait = async |seconds| {
-            // yield a bunch to make sure that background tasks have been polled
-            yield_now().await;
-            tokio::time::advance(Duration::from_secs(seconds)).await;
-            yield_now().await;
-        };
 
         for stalls in [0, 1, 2, 99] {
             let session = Uuid::new_v4();
@@ -743,6 +740,11 @@ mod tests {
                 panic!("Stream must have ended after idle timeout")
             };
         }
+
+        assert!(
+            server.sessions.lock().unwrap().is_empty(),
+            "Sessions must have been cleaned up"
+        );
     }
 
     /// Test that idle-timeout works, and that reading from a session keeps it alive
@@ -751,13 +753,6 @@ mod tests {
         // create a server with an idle-timeout of 3 seconds
         let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
         let server = Server::with_connector(config.clone(), SpamConnector);
-
-        let wait = async |seconds| {
-            // yield a bunch to make sure that background tasks have been polled
-            yield_now().await;
-            tokio::time::advance(Duration::from_secs(seconds)).await;
-            yield_now().await;
-        };
 
         for stalls in [0, 1, 2, 99] {
             let session = Uuid::new_v4();
@@ -785,6 +780,48 @@ mod tests {
                 panic!("Stream must have ended after idle timeout")
             };
         }
+
+        assert!(
+            server.sessions.lock().unwrap().is_empty(),
+            "Sessions must have been cleaned up"
+        );
+    }
+
+    /// Test that total-timeout works.
+    #[tokio::test(start_paused = true)]
+    async fn total_timeout() {
+        // create a server with a total-timeout of 5 seconds
+        let config = Config::new(dummy_addr()).with_total_timeout(Duration::from_secs(5));
+        let server = Server::with_connector(config.clone(), SpamConnector);
+
+        let session = Uuid::new_v4();
+        let mut reader = get(&server, &config, session).await;
+        yield_now().await;
+
+        let mut session_must_be_alive = || {
+            let Some(Some(Ok(_frame))) = dbg!(reader.frame().now_or_never()) else {
+                panic!("Stream should still be alive")
+            };
+        };
+
+        session_must_be_alive();
+
+        for _ in 0..4 {
+            wait(1).await;
+            session_must_be_alive();
+        }
+
+        // trigger a timeout by waiting for more than 5 seconds in total
+        wait(2).await;
+
+        let None = dbg!(reader.frame().await) else {
+            panic!("Stream must have ended after total timeout")
+        };
+
+        assert!(
+            server.sessions.lock().unwrap().is_empty(),
+            "Sessions must have been cleaned up"
+        );
     }
 
     /// Verify that we can send and receive data, and that `take_stats` returns the correct values.
