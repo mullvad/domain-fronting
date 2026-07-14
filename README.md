@@ -1,10 +1,15 @@
 # Domain Fronting
 
-A Rust library for domain fronting - tunneling TCP connections through HTTP POST requests to bypass censorship and access restrictions.
+A Rust library for domain fronting - tunneling TCP connections through HTTP requests to bypass
+censorship and access restrictions.
 
-- **Client**: Implements `AsyncRead` + `AsyncWrite` for seamless integration with async code
-- **Server**: HTTP session management with persistent upstream TCP connection per session
-- **TLS**: TLS support with SNI (requires the `tls` feature)
+Domain fronting is a technique for connecting to a web server hosted on a CDN without exposing
+the hostname in plain text. It works by setting the SNI field of the TLS client hello to a
+different domain, hosted on the same CDN, while the inner HTTP Host header points to the obscured
+domain. A mismatch in these fields is discouraged by the SNI standard, but not prohibited.
+
+The library provides a domain fronting client which implements `AsyncRead` and `AsyncWrite` for
+use with async code.
 
 ## Cargo Features
 
@@ -174,9 +179,21 @@ cargo run --bin domain_fronting_server --features examples -- \
 
 ## Protocol
 
-The domain fronting protocol works as follows:
+TCP data is tunneled through the CDN and through the domain fronting proxy using HTTP requests.
 
-- TODO
+- **Client -> CDN -> Proxy**: Data is sent as the body of repeated `POST`/`PATCH` requests.
+- **Client <- CDN <- Proxy**: The client issues one `GET` per session. The proxy streams
+  upstream data back in the response body.
+- **Proxy <-> Upstream**: The proxy opens one TCP stream to upstream per session.
+
+Requests must provide a session ID as an HTTP header (`X-Session: <random uuid>`). When the server
+receives a `GET`/`POST` request for a previously unseen session ID, it will establish a new TCP
+connection to the upstream target and start tunneling data. Subsequent `PATCH` requests with the
+same session ID will push data to the same TCP connection.
+
+The client supports talking to the CDN with either HTTP/1.1 or HTTP/2. HTTP/2 should be preferred,
+but may not be supported by all CDNs. HTTP/1.1 requires two separate TCP/TLS connections
+(one per direction). HTTP/2 uses a single connection with two concurrent streams.
 
 ## License
 
