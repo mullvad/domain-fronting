@@ -129,6 +129,8 @@ pub enum Error {
     Tls(#[source] io::Error),
     #[error("Hyper error")]
     Hyper(#[from] hyper::Error),
+    #[error("HTTP error")]
+    Http(#[from] http::Error),
     #[error("HTTP request returned {0}")]
     HttpStatusCode(StatusCode),
     #[error("Connection failed")]

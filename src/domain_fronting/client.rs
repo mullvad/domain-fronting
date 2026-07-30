@@ -364,7 +364,7 @@ impl ProxyConnection {
         Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
     {
         // exchange HTTP headers and get status code
-        let read_request = create_read_request(config, session_id);
+        let read_request = create_read_request(config, session_id)?;
         let read_response = send_request(read_request).await?;
         if !read_response.status().is_success() {
             return Err(Error::HttpStatusCode(read_response.status()));
@@ -409,7 +409,7 @@ impl ProxyConnection {
         let mut first = true;
         while let Some(chunk) = request_rx.recv().await {
             let request_body = Body::new(chunk);
-            let request = create_write_request(config, session_id, request_body, first);
+            let request = create_write_request(config, session_id, request_body, first)?;
             let write_response = send_request(request).await?;
             if write_response.status() != StatusCode::NO_CONTENT {
                 return Err(Error::HttpStatusCode(write_response.status()));
@@ -425,7 +425,7 @@ fn create_write_request(
     session_id: Uuid,
     body: Body,
     can_create_session: bool,
-) -> http::Request<Body> {
+) -> Result<http::Request<Body>, Error> {
     let scheme = config.scheme();
     let proxy_host = config.proxy_host();
     let method = if can_create_session {
@@ -442,10 +442,13 @@ fn create_write_request(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(config.session_key(), session_id.to_string())
         .body(body)
-        .expect("Request is valid")
+        .map_err(Error::Http)
 }
 
-fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Request<Body> {
+fn create_read_request(
+    config: &DomainFronting,
+    session_id: Uuid,
+) -> Result<http::Request<Body>, Error> {
     let scheme = config.scheme();
     let proxy_host = config.proxy_host();
     // Use a random path in the URI to discourage proxies to cache the request.
@@ -455,7 +458,7 @@ fn create_read_request(config: &DomainFronting, session_id: Uuid) -> http::Reque
         .header(header::ACCEPT, "*/*")
         .header(config.session_key(), session_id.to_string())
         .body(Body::default()) // Empty body
-        .expect("Request is valid")
+        .map_err(Error::Http)
 }
 
 macro_rules! check_err {
