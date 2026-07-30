@@ -144,7 +144,10 @@ impl ProxyConfig {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        assert!(tls_config.alpn_protocols.contains(&b"h2".to_vec())); // TODO
+        if !tls_config.alpn_protocols.contains(&b"h2".to_vec()) {
+            return Err(Error::MisconfiguredAlpn);
+        }
+
         let tls =
             TlsStream::connect_with_config(stream, self.domain_fronting.front_host(), tls_config)
                 .await
@@ -166,7 +169,10 @@ impl ProxyConfig {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        assert!(!tls_config.alpn_protocols.contains(&b"h2".to_vec())); // TODO
+        if tls_config.alpn_protocols.contains(&b"h2".to_vec()) {
+            return Err(Error::MisconfiguredAlpn);
+        }
+
         let tls1 = TlsStream::connect_with_config(
             stream1,
             self.domain_fronting.front_host(),

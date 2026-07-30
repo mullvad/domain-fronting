@@ -135,6 +135,10 @@ pub enum Error {
     Connection(#[source] io::Error),
     #[error("DNS resolution failed")]
     Dns(#[source] io::Error),
+    /// The TLS configuration ALPN must include "h2" if HTTP/2 is used,
+    /// and must not include "h2" if HTTP/1.1 is used.
+    #[error("Misconfigured ALPN")]
+    MisconfiguredAlpn,
     #[error("Empty DNS response")]
     EmptyDnsResponse,
 }
