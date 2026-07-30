@@ -18,7 +18,7 @@
 use clap::Parser;
 use domain_fronting::{
     DomainFronting,
-    domain_fronting::server::{Config, Server},
+    server::{Config, Server},
 };
 use futures::FutureExt;
 use hyper::{server::conn::http1, service::service_fn};

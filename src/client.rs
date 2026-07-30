@@ -225,6 +225,7 @@ impl ProxyConfig {
     }
 }
 
+/// A proxy connection. Use [`AsyncWrite`] and [`AsyncRead`] to send data through the proxy.
 pub struct ProxyConnection {
     /// [`AsyncWrite`] for the HTTP request body.
     request_tx: Box<dyn AsyncWrite + Unpin + Send>,
@@ -546,7 +547,7 @@ impl Drop for ProxyConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain_fronting::server::{self, Server};
+    use crate::server::{self, Server};
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
     use tokio::{

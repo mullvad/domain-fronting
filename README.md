@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server
 
 ```rust
-use domain_fronting::domain_fronting::server::{self, Server};
+use domain_fronting::server::{self, Server};
 use std::sync::Arc;
 
 #[tokio::main]
