@@ -100,8 +100,8 @@ struct SessionArgs<C: UpstreamConnector> {
     upstream: SocketAddr,
     server: Arc<Server<C>>,
     stats: Arc<AtomicStats>,
-    idle_timeout: Option<Duration>,
-    total_timeout: Option<Duration>,
+    idle_timeout: Duration,
+    total_timeout: Duration,
 }
 
 struct Session<C: UpstreamConnector> {
@@ -109,7 +109,7 @@ struct Session<C: UpstreamConnector> {
     upstream_write: C::Write,
     upstream_read: Option<C::Read>,
     upstream_read_abort: Option<stream::AbortHandle>,
-    idle_timeout: Option<Duration>,
+    idle_timeout: Duration,
     idle_timeout_task: Option<AbortHandle>,
     total_timeout_task: Option<AbortHandle>,
     server: Weak<Server<C>>,
@@ -131,8 +131,8 @@ impl<C: UpstreamConnector> Actor for Session<C> {
         }: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        let total_timeout_task = total_timeout.map(|timeout| actor_timeout(&actor_ref, timeout));
-        let idle_timeout_task = idle_timeout.map(|timeout| actor_timeout(&actor_ref, timeout));
+        let total_timeout_task = Some(actor_timeout(&actor_ref, total_timeout));
+        let idle_timeout_task = Some(actor_timeout(&actor_ref, idle_timeout));
 
         let (upstream_read, upstream_write) = server
             .connector
@@ -263,9 +263,7 @@ impl<C: UpstreamConnector> Session<C> {
             task.abort();
         }
 
-        self.idle_timeout_task = self
-            .idle_timeout
-            .map(|idle_timeout| actor_timeout(actor_ref, idle_timeout));
+        self.idle_timeout_task = Some(actor_timeout(actor_ref, self.idle_timeout));
     }
 }
 
@@ -314,38 +312,24 @@ pub struct Config {
     /// HTTP header key used for the session id.
     pub session_key: String,
     /// Total timeout of one HTTP request.
-    pub total_timeout: Option<Duration>,
+    pub total_timeout: Duration,
     /// Timeout of one HTTP request when no data is being sent in either direction.
-    pub idle_timeout: Option<Duration>,
+    pub idle_timeout: Duration,
 }
 
 impl Config {
-    pub fn new(upstream: SocketAddr) -> Self {
+    pub fn new(upstream: SocketAddr, total_timeout: Duration, idle_timeout: Duration) -> Self {
         Self {
             upstream,
             session_key: DomainFronting::DEFAULT_SESSION_KEY.into(),
-            total_timeout: None,
-            idle_timeout: None,
+            total_timeout,
+            idle_timeout,
         }
     }
 
     pub fn with_session_key(self, session_key: String) -> Self {
         Self {
             session_key,
-            ..self
-        }
-    }
-
-    pub fn with_total_timeout(self, total_timeout: Duration) -> Self {
-        Self {
-            total_timeout: Some(total_timeout),
-            ..self
-        }
-    }
-
-    pub fn with_idle_timeout(self, idle_timeout: Duration) -> Self {
-        Self {
-            idle_timeout: Some(idle_timeout),
             ..self
         }
     }
@@ -366,9 +350,6 @@ pub struct Stats {
 impl Server<TcpConnector> {
     /// Create a new server with the default TCP connector.
     pub fn new(config: Config) -> Arc<Self> {
-        if config.total_timeout.is_none() && config.idle_timeout.is_none() {
-            log::warn!("No timeout specified! Sessions will live forever!");
-        }
         Self::with_connector(config, TcpConnector)
     }
 }
@@ -711,7 +692,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_write() {
         // create a server with an idle-timeout of 3 seconds
-        let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
+        let config = Config::new(
+            dummy_addr(),
+            Duration::from_secs(999), // total timeout
+            Duration::from_secs(3),   // idle timeout
+        );
         let server = Server::with_connector(config.clone(), NullConnector);
 
         for stalls in [0, 1, 2, 99] {
@@ -755,7 +740,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_read() {
         // create a server with an idle-timeout of 3 seconds
-        let config = Config::new(dummy_addr()).with_idle_timeout(Duration::from_secs(3));
+        let config = Config::new(
+            dummy_addr(),
+            Duration::from_secs(999), // total timeout
+            Duration::from_secs(3),   // idle timeout
+        );
         let server = Server::with_connector(config.clone(), SpamConnector);
 
         for stalls in [0, 1, 2, 99] {
@@ -795,7 +784,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn total_timeout() {
         // create a server with a total-timeout of 5 seconds
-        let config = Config::new(dummy_addr()).with_total_timeout(Duration::from_secs(5));
+        let config = Config::new(
+            dummy_addr(),
+            Duration::from_secs(5),   // total timeout
+            Duration::from_secs(999), // idle timeout
+        );
         let server = Server::with_connector(config.clone(), SpamConnector);
 
         let session = Uuid::new_v4();
@@ -831,7 +824,11 @@ mod tests {
     /// Verify that we can send and receive data, and that `take_stats` returns the correct values.
     #[tokio::test(start_paused = true)]
     async fn stats() {
-        let config = Config::new(dummy_addr());
+        let config = Config::new(
+            dummy_addr(),
+            Duration::from_secs(5), // total timeout
+            Duration::from_secs(5), // idle timeout
+        );
         let server = Server::with_connector(config.clone(), EchoConnector);
 
         assert_eq!(server.take_stats(), Stats::default());

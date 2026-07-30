@@ -77,10 +77,13 @@
 //! ```no_run
 //! use domain_fronting::server::{self, Server};
 //! use std::sync::Arc;
+//! use std::time::Duration;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let upstream_addr = "127.0.0.1:8080".parse()?;
-//! let config = server::Config::new(upstream_addr);
+//! let total_timeout = Duration::from_secs(15);
+//! let idle_timeout = Duration::from_secs(5);
+//! let config = server::Config::new(upstream_addr, total_timeout, idle_timeout);
 //! let server = Server::new(config);
 //!
 //! // Use with hyper to handle HTTP requests

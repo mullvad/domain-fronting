@@ -64,12 +64,12 @@ struct Args {
     session_key: String,
 
     /// Total timeout of each HTTP request, in seconds.
-    #[clap(long)]
-    total_timeout: Option<f32>,
+    #[clap(long, default_value = "45")]
+    total_timeout: f32,
 
     /// Idle timeout of each HTTP request, in seconds.
-    #[clap(long)]
-    idle_timeout: Option<f32>,
+    #[clap(long, default_value = "30")]
+    idle_timeout: f32,
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
@@ -132,9 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind_addr).await?;
 
-    let mut config = Config::new(upstream).with_session_key(session_key);
-    config.total_timeout = total_timeout.map(Duration::from_secs_f32);
-    config.idle_timeout = idle_timeout.map(Duration::from_secs_f32);
+    let config = Config::new(
+        upstream,
+        Duration::from_secs_f32(total_timeout),
+        Duration::from_secs_f32(idle_timeout),
+    )
+    .with_session_key(session_key);
     let server = Server::new(config);
 
     let mut connections_since_report: u64 = 0;

@@ -549,14 +549,14 @@ mod tests {
     use super::*;
     use crate::server::{self, Server};
     use hyper_util::rt::TokioIo;
-    use std::convert::Infallible;
+    use std::{convert::Infallible, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::TcpListener,
     };
 
     /// Spawn an echo TCP server for testing. Returns the address it's listening on.
-    async fn spawn_echo_server() -> SocketAddr {
+    async fn spawn_echo_server() -> (SocketAddr, server::Config) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Failed to bind echo server");
@@ -586,7 +586,10 @@ mod tests {
             }
         });
 
-        addr
+        (
+            addr,
+            server::Config::new(addr, Duration::from_secs(5), Duration::from_secs(5)),
+        )
     }
 
     fn serve_requests(
@@ -615,13 +618,12 @@ mod tests {
     #[tokio::test]
     async fn test_client_server_bidirectional() {
         // Spawn echo server that will be the upstream target
-        let echo_addr = spawn_echo_server().await;
+        let (echo_addr, config) = spawn_echo_server().await;
 
         // Create in-memory transport between client and proxy server HTTP layers
         let (client_stream, server_stream) = duplex(8192);
 
         // Start proxy server with default TCP connector pointing to echo server
-        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
         // Spawn a task to serve requests
@@ -673,13 +675,12 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_sessions() {
         // Spawn echo server
-        let echo_addr = spawn_echo_server().await;
+        let (echo_addr, config) = spawn_echo_server().await;
 
         // Create two separate client-server pairs
         let (client_stream1, server_stream1) = duplex(8192);
         let (client_stream2, server_stream2) = duplex(8192);
 
-        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
         // Spawn tasks to serve requests
@@ -723,10 +724,9 @@ mod tests {
     #[tokio::test]
     async fn test_connection_task_stopped_on_drop() {
         // Spawn echo server
-        let echo_addr = spawn_echo_server().await;
+        let (echo_addr, config) = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(8192);
-        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
         // Spawn a task to serve requests
@@ -763,10 +763,9 @@ mod tests {
     #[tokio::test]
     async fn test_large_data_transfer() {
         // Spawn echo server
-        let echo_addr = spawn_echo_server().await;
+        let (echo_addr, config) = spawn_echo_server().await;
 
         let (client_stream, server_stream) = duplex(65536);
-        let config = server::Config::new(echo_addr);
         let server = server::Server::new(config);
 
         // Spawn a task to serve requests
