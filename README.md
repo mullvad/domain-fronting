@@ -46,7 +46,7 @@ domain-fronting = { version = "0.1", features = ["tls"] }
 ```
 
 ```rust
-use domain_fronting::{DomainFronting, ProxyConfig};
+use domain_fronting::{DomainFronting, client::ProxyConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::ClientConfig;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 To provide your own transport stream (e.g. for testing or when the TCP connection is managed externally):
 
 ```rust
-use domain_fronting::{DomainFronting, ProxyConfig};
+use domain_fronting::{DomainFronting, client::ProxyConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ClientConfig;
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server
 
 ```rust
-use domain_fronting::domain_fronting::server::{self, Server};
+use domain_fronting::server::{self, Server};
 use std::sync::Arc;
 
 #[tokio::main]
