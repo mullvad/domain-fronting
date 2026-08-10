@@ -314,9 +314,9 @@ pub struct Config {
     pub upstream: SocketAddr,
     /// HTTP header key used for the session id.
     pub session_key: String,
-    /// Total timeout of one HTTP request.
+    /// Total lifetime of a session, from creation until it is forcefully closed.
     pub total_timeout: Duration,
-    /// Timeout of one HTTP request when no data is being sent in either direction.
+    /// Timeout of a session when no data is being sent in either direction.
     pub idle_timeout: Duration,
 }
 
@@ -376,8 +376,8 @@ impl<C: UpstreamConnector> Server<C> {
     /// If `request` contains an unknown session ID, and the method is not `PATCH`,
     /// this creates a new session and connection to upstream.
     ///
-    /// If `request` is a `GET` request, the response will be a stream of data from upstream.
-    /// If `request` is a `POST` or `PATCH` request, the request body will be a written to upstream.
+    /// If `request` is a `GET` request, the response body will contain data read from upstream.
+    /// If `request` is a `POST` or `PATCH` request, the request body will be written to upstream.
     ///
     /// # Status code
     /// - On any error the HTTP status code will be `BAD REQUEST`.

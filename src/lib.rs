@@ -101,11 +101,11 @@
 //!
 //! # Protocol
 //!
-//! TCP data is tunneled through through the server using HTTP requests.
+//! TCP data is tunneled through the server using HTTP requests.
 //!
 //! - **Client -> CDN -> Server**: Data is sent as the body of repeated `POST`/`PATCH` requests.
-//! - **Client <- CDN <- Server**: The client issues one `GET` per session. The server streams
-//!   upstream data back in the response body.
+//! - **Client <- CDN <- Server**: The client issues repeated `GET` requests to long-poll for
+//!   upstream data. The server returns upstream data in the response body.
 //! - **Server <-> Upstream**: The server opens one TCP stream to upstream per session.
 //!
 //! Requests must provide a session ID as an HTTP header (`X-Session: <random uuid>`). When the

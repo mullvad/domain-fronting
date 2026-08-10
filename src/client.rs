@@ -261,7 +261,7 @@ impl ProxyConnection {
     /// This performs an HTTP/1.1 handshake over each provided stream.
     /// Use `ProxyConfig::connect_stream_with_tls` if you need TLS support.
     ///
-    /// One stream is used to streaming data from the proxy to us. The other is used to
+    /// One stream is used to stream data from the proxy to us. The other is used to
     /// push data from us to the proxy. HTTP1.1 can theoretically support streaming the
     /// request/response bodies concurrently, but in practice a lot of implementations
     /// do not support this.
@@ -353,7 +353,7 @@ impl ProxyConnection {
         })
     }
 
-    /// Send an HTTP request, and stream the response body into `response_tx`.
+    /// Repeatedly send `GET` requests and forward the response body chunks into `response_tx`.
     async fn pump_incoming<F, Fut>(
         session_id: Uuid,
         mut response_tx: futures::channel::mpsc::Sender<io::Result<Bytes>>,
