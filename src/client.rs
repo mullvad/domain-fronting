@@ -17,8 +17,9 @@
 
 //! Domain fronting client implementation.
 
+#[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
+use std::{io, net::SocketAddr, pin::Pin, task::Poll};
 
 use futures::FutureExt;
 use futures::{SinkExt, TryFutureExt, future::try_join};
@@ -300,13 +301,12 @@ impl ProxyConnection {
 
         // For HTTP/2, use the same connection to do both read and write requests.
         // let connection_task = tokio::spawn(conn).abort_handle();
-        let sender = Arc::new(Mutex::new(sender));
-        let (recv_req, send_req) = (sender.clone(), sender);
+        let (mut recv_req, mut send_req) = (sender.clone(), sender);
 
         Self::start_proxy(
             conn,
-            move |req| recv_req.lock().unwrap().send_request(req),
-            move |req| send_req.lock().unwrap().send_request(req),
+            move |req| recv_req.send_request(req),
+            move |req| send_req.send_request(req),
             config,
         )
     }
