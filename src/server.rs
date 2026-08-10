@@ -509,7 +509,6 @@ impl<C: UpstreamConnector> Server<C> {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
-            .header(header::TRANSFER_ENCODING, "chunked")
             .body(body)
             .expect("Response is valid"))
     }
