@@ -17,8 +17,9 @@
 
 //! Domain fronting client implementation.
 
+#[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::{io, net::SocketAddr, pin::Pin, sync::Mutex, task::Poll};
+use std::{io, net::SocketAddr, pin::Pin, task::Poll};
 
 use futures::FutureExt;
 use futures::{SinkExt, TryFutureExt, future::try_join};
@@ -260,7 +261,7 @@ impl ProxyConnection {
     /// This performs an HTTP/1.1 handshake over each provided stream.
     /// Use `ProxyConfig::connect_stream_with_tls` if you need TLS support.
     ///
-    /// One stream is used to streaming data from the proxy to us. The other is used to
+    /// One stream is used to stream data from the proxy to us. The other is used to
     /// push data from us to the proxy. HTTP1.1 can theoretically support streaming the
     /// request/response bodies concurrently, but in practice a lot of implementations
     /// do not support this.
@@ -300,13 +301,12 @@ impl ProxyConnection {
 
         // For HTTP/2, use the same connection to do both read and write requests.
         // let connection_task = tokio::spawn(conn).abort_handle();
-        let sender = Arc::new(Mutex::new(sender));
-        let (recv_req, send_req) = (sender.clone(), sender);
+        let (mut recv_req, mut send_req) = (sender.clone(), sender);
 
         Self::start_proxy(
             conn,
-            move |req| recv_req.lock().unwrap().send_request(req),
-            move |req| send_req.lock().unwrap().send_request(req),
+            move |req| recv_req.send_request(req),
+            move |req| send_req.send_request(req),
             config,
         )
     }
@@ -353,7 +353,7 @@ impl ProxyConnection {
         })
     }
 
-    /// Send an HTTP request, and stream the response body into `response_tx`.
+    /// Repeatedly send `GET` requests and forward the response body chunks into `response_tx`.
     async fn pump_incoming<F, Fut>(
         session_id: Uuid,
         mut response_tx: futures::channel::mpsc::Sender<io::Result<Bytes>>,
@@ -364,32 +364,36 @@ impl ProxyConnection {
         F: FnMut(Request<Body>) -> Fut + 'static,
         Fut: Future<Output = hyper::Result<Response<Incoming>>> + Send,
     {
-        // exchange HTTP headers and get status code
-        let read_request = create_read_request(config, session_id)?;
-        let read_response = send_request(read_request).await?;
-        if !read_response.status().is_success() {
-            return Err(Error::HttpStatusCode(read_response.status()));
-        }
-
-        // start streaming response data
-        let mut body = read_response.into_body();
         loop {
-            match body.frame().await {
-                None => break,
-                Some(Err(err)) => {
-                    _ = response_tx.send(Err(io::Error::other(err))).await;
-                    break;
-                }
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        if response_tx.send(Ok(data)).await.is_err() {
-                            break;
+            // exchange HTTP headers and get status code
+            let read_request = create_read_request(config, session_id)?;
+            let read_response = send_request(read_request).await?;
+            if !read_response.status().is_success() {
+                return Err(Error::HttpStatusCode(read_response.status()));
+            }
+
+            // start streaming response data
+            let mut body = read_response.into_body();
+            loop {
+                match body.frame().await {
+                    None => break,
+                    Some(Err(err)) => {
+                        _ = response_tx.send(Err(io::Error::other(err))).await;
+                        return Ok(());
+                    }
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            if data.is_empty() {
+                                break;
+                            }
+                            if response_tx.send(Ok(data)).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
         }
-        Ok(())
     }
 
     /// Send [`Bytes`] from `request_tx` to the proxy.
@@ -549,10 +553,11 @@ mod tests {
     use super::*;
     use crate::server::{self, Server};
     use hyper_util::rt::TokioIo;
-    use std::{convert::Infallible, time::Duration};
+    use std::{convert::Infallible, sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::TcpListener,
+        time::timeout,
     };
 
     /// Spawn an echo TCP server for testing. Returns the address it's listening on.
@@ -762,42 +767,46 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_data_transfer() {
-        // Spawn echo server
-        let (echo_addr, config) = spawn_echo_server().await;
+        timeout(Duration::from_secs(1), async {
+            // Spawn echo server
+            let (echo_addr, config) = spawn_echo_server().await;
 
-        let (client_stream, server_stream) = duplex(65536);
-        let server = server::Server::new(config);
+            let (client_stream, server_stream) = duplex(65536);
+            let server = server::Server::new(config);
 
-        // Spawn a task to serve requests
-        serve_requests(server_stream, server.clone());
+            // Spawn a task to serve requests
+            serve_requests(server_stream, server.clone());
 
-        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
+            let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
 
-        let mut client = proxy_config
-            .connect_http2_over_stream(client_stream)
-            .await
-            .expect("Failed to create client");
+            let mut client = proxy_config
+                .connect_http2_over_stream(client_stream)
+                .await
+                .expect("Failed to create client");
 
-        // Send 100KB of data
-        let large_data = vec![0x42u8; 100_000];
-        client
-            .write_all(&large_data)
-            .await
-            .expect("Failed to write large data");
+            // Send 100KB of data
+            let large_data = vec![0x42u8; 100_000];
+            client
+                .write_all(&large_data)
+                .await
+                .expect("Failed to write large data");
 
-        // Read the echo response
-        let mut received = Vec::new();
-        let mut buffer = vec![0u8; 4096];
+            // Read the echo response
+            let mut received = Vec::new();
+            let mut buffer = vec![0u8; 4096];
 
-        while received.len() < large_data.len() {
-            match client.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => received.extend_from_slice(&buffer[..n]),
-                Err(e) => panic!("Read error: {}", e),
+            while received.len() < large_data.len() {
+                match client.read(&mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => received.extend_from_slice(&buffer[..n]),
+                    Err(e) => panic!("Read error: {}", e),
+                }
             }
-        }
 
-        assert_eq!(received.len(), large_data.len(), "Did not receive all data");
-        assert_eq!(received, large_data, "Data corruption detected");
+            assert_eq!(received.len(), large_data.len(), "Did not receive all data");
+            assert_eq!(received, large_data, "Data corruption detected");
+        })
+        .await
+        .map_err(|_| panic!("test must complete within deadline"));
     }
 }

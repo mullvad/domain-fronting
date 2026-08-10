@@ -35,7 +35,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use bytes::BytesMut;
-use futures::{Stream, StreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, stream};
 use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Either, Empty, StreamBody};
 use hyper::body::{Body, Bytes, Frame};
@@ -47,6 +47,7 @@ use kameo::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, tcp},
+    sync::OwnedMutexGuard,
     task::AbortHandle,
     time::sleep,
 };
@@ -107,7 +108,7 @@ struct SessionArgs<C: UpstreamConnector> {
 struct Session<C: UpstreamConnector> {
     session_id: Uuid,
     upstream_write: C::Write,
-    upstream_read: Option<C::Read>,
+    upstream_read: Arc<tokio::sync::Mutex<C::Read>>,
     upstream_read_abort: Option<stream::AbortHandle>,
     idle_timeout: Duration,
     idle_timeout_task: Option<AbortHandle>,
@@ -143,7 +144,7 @@ impl<C: UpstreamConnector> Actor for Session<C> {
         let mut session = Session {
             session_id,
             upstream_write,
-            upstream_read: Some(upstream_read),
+            upstream_read: Arc::new(upstream_read.into()),
             upstream_read_abort: None,
             idle_timeout,
             idle_timeout_task,
@@ -169,39 +170,41 @@ impl<C: UpstreamConnector> Message<SessionRead> for Session<C> {
         _msg: SessionRead,
         ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // There can only ever be one reader.
-        // If we get another read request, ignore it
-        let reader = self.upstream_read.take()?;
+        // There can only be one reader at a time.
+        // If we get a concurrent read request, ignore it
+        let reader = self.upstream_read.clone().try_lock_owned().ok()?;
 
         struct StreamState<C: UpstreamConnector> {
-            reader: C::Read,
+            reader: OwnedMutexGuard<C::Read>,
+            first: bool,
             session: WeakActorRef<Session<C>>,
-            buf: BytesMut,
             stats: Arc<AtomicStats>,
         }
 
         let state = StreamState {
             reader,
+            first: true,
             session: ctx.actor_ref().downgrade(),
-            buf: BytesMut::new(),
             stats: self.stats.clone(),
         };
 
-        impl<C: UpstreamConnector> Drop for StreamState<C> {
-            fn drop(&mut self) {
-                self.session.kill();
-            }
-        }
-
         let stream = stream::unfold(state, |mut state| async move {
-            debug_assert!(state.buf.is_empty());
-            if state.buf.capacity() < 1024 {
-                state.buf.reserve(4096);
-            }
+            let mut buf = BytesMut::with_capacity(2048);
 
-            let bytes = match state.reader.read_buf(&mut state.buf).await {
-                Ok(1..) => state.buf.split().freeze(),
-                _ => return None,
+            let read = state.reader.read_buf(&mut buf);
+
+            let result = if state.first {
+                // For the first read: Wait as long as it takes.
+                state.first = false;
+                read.await
+            } else {
+                // For subsequent reads: Abort if data is not immediately available.
+                read.now_or_never()?
+            };
+
+            let bytes = match result {
+                Ok(1..) => buf.split().freeze(),
+                Ok(0) | Err(_) => return None,
             };
 
             let n = bytes.len() as u64;
@@ -311,9 +314,9 @@ pub struct Config {
     pub upstream: SocketAddr,
     /// HTTP header key used for the session id.
     pub session_key: String,
-    /// Total timeout of one HTTP request.
+    /// Total lifetime of a session, from creation until it is forcefully closed.
     pub total_timeout: Duration,
-    /// Timeout of one HTTP request when no data is being sent in either direction.
+    /// Timeout of a session when no data is being sent in either direction.
     pub idle_timeout: Duration,
 }
 
@@ -373,8 +376,8 @@ impl<C: UpstreamConnector> Server<C> {
     /// If `request` contains an unknown session ID, and the method is not `PATCH`,
     /// this creates a new session and connection to upstream.
     ///
-    /// If `request` is a `GET` request, the response will be a stream of data from upstream.
-    /// If `request` is a `POST` or `PATCH` request, the request body will be a written to upstream.
+    /// If `request` is a `GET` request, the response body will contain data read from upstream.
+    /// If `request` is a `POST` or `PATCH` request, the request body will be written to upstream.
     ///
     /// # Status code
     /// - On any error the HTTP status code will be `BAD REQUEST`.
@@ -506,7 +509,6 @@ impl<C: UpstreamConnector> Server<C> {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CACHE_CONTROL, "no-cache, no-store, no-transform")
-            .header(header::TRANSFER_ENCODING, "chunked")
             .body(body)
             .expect("Response is valid"))
     }

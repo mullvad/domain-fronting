@@ -63,11 +63,11 @@ struct Args {
     #[clap(long, default_value = {DomainFronting::DEFAULT_SESSION_KEY})]
     session_key: String,
 
-    /// Total timeout of each HTTP request, in seconds.
+    /// Total lifetime of a session, from creation until it is forcefully closed, in seconds.
     #[clap(long, default_value = "45")]
     total_timeout: f32,
 
-    /// Idle timeout of each HTTP request, in seconds.
+    /// Idle timeout of a session when no data is being sent in either direction, in seconds.
     #[clap(long, default_value = "30")]
     idle_timeout: f32,
 }
