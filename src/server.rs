@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use bytes::BytesMut;
 use futures::{FutureExt, Stream, StreamExt, stream};
 use http::{Request, Response, StatusCode, header};
@@ -357,6 +357,18 @@ impl Server<TcpConnector> {
     }
 }
 
+/// An [`anyhow::Error`] with an accompanying HTTP `StatusCode`.
+struct HttpError {
+    error: anyhow::Error,
+    code: StatusCode,
+}
+
+macro_rules! bail {
+    ($t:tt) => {
+        return Err(anyhow::anyhow!($t).into())
+    };
+}
+
 impl<C: UpstreamConnector> Server<C> {
     /// Create a new server with a custom connector.
     ///
@@ -380,8 +392,9 @@ impl<C: UpstreamConnector> Server<C> {
     /// If `request` is a `POST` or `PATCH` request, the request body will be written to upstream.
     ///
     /// # Status code
-    /// - On any error the HTTP status code will be `BAD REQUEST`.
-    /// - Otherwise, the status code will be `OK` or `NO_CONTENT`.
+    /// - `TOO_MANY_REQUESTS` on multiple concurrent `GET` requests.
+    /// - `BAD_REQUEST` on any other error.
+    /// - `OK` or `NO_CONTENT` on success.
     pub async fn handle_request<B, E>(
         self: Arc<Self>,
         request: Request<B>,
@@ -393,17 +406,18 @@ impl<C: UpstreamConnector> Server<C> {
     {
         self.handle_request_inner(request)
             .await
-            .unwrap_or_else(|err| {
-                log::debug!("handle_request error: {err:?}");
-                bad_request().map(Either::Left)
+            .unwrap_or_else(|e| {
+                log::debug!("handle_request error: {:?}", e.error);
+                e.into_response().map(Either::Left)
             })
     }
 
-    pub async fn handle_request_inner<B, E>(
+    async fn handle_request_inner<B, E>(
         self: Arc<Self>,
         request: Request<B>,
-    ) -> anyhow::Result<
+    ) -> Result<
         Response<Either<Empty<Bytes>, StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>>,
+        HttpError,
     >
     where
         B: Body<Data = Bytes, Error = E>,
@@ -499,11 +513,13 @@ impl<C: UpstreamConnector> Server<C> {
     async fn handle_read_request(
         self: Arc<Self>,
         session: ActorRef<Session<C>>,
-    ) -> anyhow::Result<Response<StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>> {
+    ) -> Result<Response<StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>>>, HttpError> {
         let stream = session
             .ask(SessionRead)
-            .await?
-            .context("Multiple read requests are not allowed")?;
+            .await
+            .context("Session actor is dead")?
+            .context("Multiple read requests are not allowed")
+            .map_err(HttpError::code(StatusCode::TOO_MANY_REQUESTS))?;
         let body = StreamBody::new(stream);
         Ok(Response::builder()
             .status(StatusCode::OK)
@@ -513,9 +529,9 @@ impl<C: UpstreamConnector> Server<C> {
             .expect("Response is valid"))
     }
 
-    /// Connect to upstream and crate a new `session`.
+    /// Spawn a [`Session`] actor that connects to upstream.
     ///
-    /// Returns `Err` if connection to upstream fails.
+    /// If connection to upstream fails, the actor dies before processing any messages.
     fn new_session(self: &Arc<Self>, session_id: Uuid) -> ActorRef<Session<C>> {
         Session::spawn(SessionArgs {
             session_id,
@@ -532,14 +548,6 @@ impl<C: UpstreamConnector> Server<C> {
     }
 }
 
-/// Build an HTTP [`Response`] with status code `400` and no data.
-fn bad_request() -> Response<Empty<Bytes>> {
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Empty::new())
-        .expect("response is valid")
-}
-
 impl AtomicStats {
     /// Make a copy of the current stats.
     fn freeze(&self) -> Stats {
@@ -554,6 +562,32 @@ impl AtomicStats {
         Stats {
             bytes_tx: self.bytes_tx.swap(0, Ordering::Relaxed),
             bytes_rx: self.bytes_rx.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+impl HttpError {
+    /// Create a constructor that wraps an `anyhow` error into an `HttpError`
+    pub fn code<T: Into<anyhow::Error>>(code: StatusCode) -> impl FnOnce(T) -> Self {
+        move |error| Self {
+            error: error.into(),
+            code,
+        }
+    }
+
+    pub fn into_response(self) -> Response<Empty<Bytes>> {
+        Response::builder()
+            .status(self.code)
+            .body(Empty::new())
+            .expect("response is valid")
+    }
+}
+
+impl From<anyhow::Error> for HttpError {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            code: StatusCode::BAD_REQUEST,
         }
     }
 }
