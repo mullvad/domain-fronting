@@ -17,26 +17,26 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::Parser;
 use domain_fronting::DomainFronting;
 use http::Uri;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, stdin, stdout};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
+/// Send stdin/stdout through a domain fronting proxy.
 #[derive(Parser, Debug)]
 pub struct Arguments {
     /// The domain used to hide the actual destination.
     #[arg(long)]
     front: Uri,
 
+    #[arg(long)]
+    http2: bool,
+
     /// The host being reached via `front`.
     #[arg(long)]
     host: String,
-
-    /// URL to fetch (defaults to a simple GET request)
-    #[clap(short = 'u', long)]
-    url: Option<String>,
 }
 
 #[tokio::main]
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
         .init();
 
-    let Arguments { front, host, url } = Arguments::parse();
+    let Arguments { host, front, http2 } = Arguments::parse();
 
     let domain_fronting = DomainFronting::new(front.clone(), host.clone());
     let proxy_config = domain_fronting
@@ -58,34 +58,31 @@ async fn main() -> anyhow::Result<()> {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
 
-        let tls_config = Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
-        proxy_config.connect_https1_1(tls_config).await
+        if http2 {
+            tls_config.alpn_protocols.push(b"h2".to_vec());
+        }
+
+        let tls_config = Arc::new(tls_config);
+
+        if http2 {
+            proxy_config.connect_https2(tls_config).await
+        } else {
+            proxy_config.connect_https1_1(tls_config).await
+        }
+    } else if http2 {
+        bail!("HTTP/2 requires TLS")
     } else {
         proxy_config.connect_http1_1().await
     }
     .context(anyhow!("Failed to connect to {host:?} with front {front}"))?;
 
-    // Send a simple HTTP GET request
-    let url = url.unwrap_or_else(|| format!("https://{}/", host));
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        url, host
-    );
+    let mut stdio = tokio::io::join(stdin(), stdout());
 
-    log::info!("Sending request: {}", request.lines().next().unwrap_or(""));
-    connection.write_all(request.as_bytes()).await?;
-
-    // Read response
-    let mut response = Vec::new();
-    connection.read_to_end(&mut response).await?;
-
-    log::info!("Received {} bytes", response.len());
-    println!("{}", String::from_utf8_lossy(&response));
+    copy_bidirectional(&mut connection, &mut stdio).await?;
 
     Ok(())
 }
