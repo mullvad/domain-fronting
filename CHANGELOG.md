@@ -8,5 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.2.0] - 2026-09-24
+- Reachitecture protocol to use long-polling for efficiency.
+- Add HTTP/2 support to the client.
+
+
 ## [0.1.0] - 2026-04-29
 - Add domain fronting server and client library
