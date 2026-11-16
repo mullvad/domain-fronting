@@ -126,7 +126,9 @@ use crate::dns::{DefaultDnsResolver, DnsResolver as _};
 
 pub mod client;
 pub mod dns;
+pub mod happy_eyeballs;
 pub mod server;
+
 #[cfg(feature = "tls")]
 mod tls_stream;
 
@@ -222,8 +224,16 @@ impl DomainFronting {
             .resolve(uri.host().unwrap_or_default())
             .await
             .map_err(Error::Dns)?;
-        let &addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
 
-        Ok(ProxyConfig::new(SocketAddr::new(addr, port), self.clone()))
+        if addrs.is_empty() {
+            return Err(Error::EmptyDnsResponse);
+        }
+
+        let addrs = addrs
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+
+        Ok(ProxyConfig::new(addrs, self.clone()))
     }
 }

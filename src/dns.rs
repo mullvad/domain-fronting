@@ -1,6 +1,8 @@
 use std::{io, net::IpAddr};
 
 /// DNS resolver trait for resolving hostnames to IP addresses.
+///
+/// Implementations should sort addresses per RFC 6724 section 6, Destination Address Selection.
 #[async_trait::async_trait]
 pub trait DnsResolver: 'static + Send + Sync {
     async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>>;
