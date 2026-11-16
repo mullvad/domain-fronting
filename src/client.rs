@@ -76,7 +76,7 @@ impl ProxyConfig {
     /// ```no_run
     /// # #[cfg(feature = "tls")]
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// use domain_fronting::{DomainFronting, ProxyConfig};
+    /// use domain_fronting::{DomainFronting, client::ProxyConfig};
     /// use std::sync::Arc;
     /// use tokio_rustls::rustls;
     ///

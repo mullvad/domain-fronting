@@ -36,7 +36,7 @@
 //! ```no_run
 //! # #[cfg(feature = "tls")]
 //! # async fn example_impl() -> Result<(), Box<dyn std::error::Error>> {
-//! use domain_fronting::{DomainFronting, ProxyConfig};
+//! use domain_fronting::{DomainFronting, client::ProxyConfig};
 //! use tokio::io::{AsyncReadExt, AsyncWriteExt};
 //! use std::sync::Arc;
 //!
