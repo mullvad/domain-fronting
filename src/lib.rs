@@ -120,6 +120,7 @@
 use http::uri::Scheme;
 use http::{StatusCode, Uri};
 use std::{io, net::SocketAddr};
+use vec1::Vec1;
 
 use crate::client::ProxyConfig;
 use crate::dns::{DefaultDnsResolver, DnsResolver as _};
@@ -225,14 +226,14 @@ impl DomainFronting {
             .await
             .map_err(Error::Dns)?;
 
-        if addrs.is_empty() {
-            return Err(Error::EmptyDnsResponse);
-        }
-
-        let addrs = addrs
+        let addrs: Vec<_> = addrs
             .into_iter()
             .map(|ip| SocketAddr::new(ip, port))
             .collect();
+
+        let Ok(addrs) = Vec1::try_from(addrs) else {
+            return Err(Error::EmptyDnsResponse);
+        };
 
         Ok(ProxyConfig::new(addrs, self.clone()))
     }

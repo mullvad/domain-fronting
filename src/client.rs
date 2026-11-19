@@ -41,6 +41,7 @@ use tokio_util::{
 
 use tokio::net::TcpStream;
 use uuid::Uuid;
+use vec1::Vec1;
 
 use crate::happy_eyeballs;
 
@@ -56,22 +57,18 @@ use super::{DomainFronting, Error};
 #[derive(PartialEq, Debug, Clone)]
 pub struct ProxyConfig {
     /// The resolved socket addresses of the CDN.
-    addrs: Vec<SocketAddr>,
+    pub addrs: Vec1<SocketAddr>,
     /// Internal domain fronting configuration
     domain_fronting: DomainFronting,
 }
 
 impl ProxyConfig {
     /// Create a new ProxyConfig with the given address and domain fronting configuration.
-    pub fn new(addrs: Vec<SocketAddr>, domain_fronting: DomainFronting) -> Self {
+    pub fn new(addrs: Vec1<SocketAddr>, domain_fronting: DomainFronting) -> Self {
         Self {
             addrs,
             domain_fronting,
         }
-    }
-
-    pub fn addrs(&self) -> &[SocketAddr] {
-        &self.addrs
     }
 
     /// Connect to the proxy with HTTP/2 using a TCP connection with TLS and a custom certificate configuration.
@@ -641,7 +638,7 @@ mod tests {
         serve_requests(server_stream, server.clone());
 
         // Create client connection using the in-memory stream (no TLS)
-        let proxy_config = ProxyConfig::new(vec![echo_addr], example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let mut client = proxy_config
             .connect_http2_over_stream(client_stream)
@@ -699,7 +696,7 @@ mod tests {
         serve_requests(server_stream2, server.clone());
 
         // Create two client connections
-        let proxy_config = ProxyConfig::new(vec![echo_addr], example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let mut client1 = proxy_config
             .connect_http2_over_stream(client_stream1)
@@ -743,7 +740,7 @@ mod tests {
         // Spawn a task to serve requests
         serve_requests(server_stream, server.clone());
 
-        let proxy_config = ProxyConfig::new(vec![echo_addr], example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let client = proxy_config
             .connect_http2_over_stream(client_stream)
@@ -783,7 +780,7 @@ mod tests {
             // Spawn a task to serve requests
             serve_requests(server_stream, server.clone());
 
-            let proxy_config = ProxyConfig::new(vec![echo_addr], example_df_config());
+            let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
             let mut client = proxy_config
                 .connect_http2_over_stream(client_stream)
