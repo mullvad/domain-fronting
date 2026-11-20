@@ -125,6 +125,15 @@ use vec1::Vec1;
 use crate::client::ProxyConfig;
 use crate::dns::{DefaultDnsResolver, DnsResolver as _};
 
+// Re-export crates used in public API.
+pub use http;
+pub use http_body_util;
+pub use hyper;
+#[cfg(feature = "tls")]
+pub use rustls;
+pub use tokio;
+pub use vec1;
+
 pub mod client;
 pub mod dns;
 pub mod happy_eyeballs;
