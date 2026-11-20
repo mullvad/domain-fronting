@@ -21,8 +21,7 @@
 use std::sync::Arc;
 use std::{io, net::SocketAddr, pin::Pin, task::Poll};
 
-use futures::FutureExt;
-use futures::{SinkExt, TryFutureExt, future::try_join};
+use futures::{FutureExt as _, SinkExt as _, TryFutureExt as _, future::try_join};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -42,6 +41,9 @@ use tokio_util::{
 
 use tokio::net::TcpStream;
 use uuid::Uuid;
+use vec1::Vec1;
+
+use crate::happy_eyeballs;
 
 #[cfg(feature = "tls")]
 use {crate::tls_stream::TlsStream, tokio_rustls::rustls};
@@ -54,17 +56,17 @@ use super::{DomainFronting, Error};
 /// Created from [`DomainFronting::proxy_config()`].
 #[derive(PartialEq, Debug, Clone)]
 pub struct ProxyConfig {
-    /// The resolved socket address of the CDN.
-    pub addr: SocketAddr,
+    /// The resolved socket addresses of the CDN.
+    pub addrs: Vec1<SocketAddr>,
     /// Internal domain fronting configuration
     domain_fronting: DomainFronting,
 }
 
 impl ProxyConfig {
     /// Create a new ProxyConfig with the given address and domain fronting configuration.
-    pub fn new(addr: SocketAddr, domain_fronting: DomainFronting) -> Self {
+    pub fn new(addrs: Vec1<SocketAddr>, domain_fronting: DomainFronting) -> Self {
         Self {
-            addr,
+            addrs,
             domain_fronting,
         }
     }
@@ -76,7 +78,7 @@ impl ProxyConfig {
     /// ```no_run
     /// # #[cfg(feature = "tls")]
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// use domain_fronting::{DomainFronting, ProxyConfig};
+    /// use domain_fronting::{DomainFronting, client::ProxyConfig};
     /// use std::sync::Arc;
     /// use tokio_rustls::rustls;
     ///
@@ -107,9 +109,10 @@ impl ProxyConfig {
         &self,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<ProxyConnection, Error> {
-        let tcp_stream = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
+        let tcp_stream =
+            happy_eyeballs::connect(&self.addrs, async |addr| TcpStream::connect(addr).await)
+                .await
+                .map_err(Error::Connection)?;
         self.connect_https2_over_stream(tcp_stream, tls_config)
             .await
     }
@@ -122,12 +125,12 @@ impl ProxyConfig {
         &self,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<ProxyConnection, Error> {
-        let tcp_stream1 = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
-        let tcp_stream2 = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
+        let (tcp_stream1, tcp_stream2) = happy_eyeballs::connect(&self.addrs, |addr| {
+            try_join(TcpStream::connect(addr), TcpStream::connect(addr))
+        })
+        .await
+        .map_err(Error::Connection)?;
+
         self.connect_https1_1_over_streams(tcp_stream1, tcp_stream2, tls_config)
             .await
     }
@@ -189,12 +192,12 @@ impl ProxyConfig {
     }
 
     pub async fn connect_http1_1(&self) -> Result<ProxyConnection, Error> {
-        let tcp_stream1 = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
-        let tcp_stream2 = TcpStream::connect(self.addr)
-            .await
-            .map_err(Error::Connection)?;
+        let (tcp_stream1, tcp_stream2) = happy_eyeballs::connect(&self.addrs, |addr| {
+            try_join(TcpStream::connect(addr), TcpStream::connect(addr))
+        })
+        .await
+        .map_err(Error::Connection)?;
+
         self.connect_http1_1_over_streams(tcp_stream1, tcp_stream2)
             .await
     }
@@ -635,7 +638,7 @@ mod tests {
         serve_requests(server_stream, server.clone());
 
         // Create client connection using the in-memory stream (no TLS)
-        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let mut client = proxy_config
             .connect_http2_over_stream(client_stream)
@@ -693,7 +696,7 @@ mod tests {
         serve_requests(server_stream2, server.clone());
 
         // Create two client connections
-        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let mut client1 = proxy_config
             .connect_http2_over_stream(client_stream1)
@@ -737,7 +740,7 @@ mod tests {
         // Spawn a task to serve requests
         serve_requests(server_stream, server.clone());
 
-        let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
+        let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
         let client = proxy_config
             .connect_http2_over_stream(client_stream)
@@ -777,7 +780,7 @@ mod tests {
             // Spawn a task to serve requests
             serve_requests(server_stream, server.clone());
 
-            let proxy_config = ProxyConfig::new(echo_addr, example_df_config());
+            let proxy_config = ProxyConfig::new(Vec1::new(echo_addr), example_df_config());
 
             let mut client = proxy_config
                 .connect_http2_over_stream(client_stream)

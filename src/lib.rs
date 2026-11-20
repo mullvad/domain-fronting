@@ -36,7 +36,7 @@
 //! ```no_run
 //! # #[cfg(feature = "tls")]
 //! # async fn example_impl() -> Result<(), Box<dyn std::error::Error>> {
-//! use domain_fronting::{DomainFronting, ProxyConfig};
+//! use domain_fronting::{DomainFronting, client::ProxyConfig};
 //! use tokio::io::{AsyncReadExt, AsyncWriteExt};
 //! use std::sync::Arc;
 //!
@@ -120,13 +120,25 @@
 use http::uri::Scheme;
 use http::{StatusCode, Uri};
 use std::{io, net::SocketAddr};
+use vec1::Vec1;
 
 use crate::client::ProxyConfig;
 use crate::dns::{DefaultDnsResolver, DnsResolver as _};
 
+// Re-export crates used in public API.
+pub use http;
+pub use http_body_util;
+pub use hyper;
+#[cfg(feature = "tls")]
+pub use rustls;
+pub use tokio;
+pub use vec1;
+
 pub mod client;
 pub mod dns;
+pub mod happy_eyeballs;
 pub mod server;
+
 #[cfg(feature = "tls")]
 mod tls_stream;
 
@@ -222,8 +234,16 @@ impl DomainFronting {
             .resolve(uri.host().unwrap_or_default())
             .await
             .map_err(Error::Dns)?;
-        let &addr = addrs.first().ok_or(Error::EmptyDnsResponse)?;
 
-        Ok(ProxyConfig::new(SocketAddr::new(addr, port), self.clone()))
+        let addrs: Vec<_> = addrs
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+
+        let Ok(addrs) = Vec1::try_from(addrs) else {
+            return Err(Error::EmptyDnsResponse);
+        };
+
+        Ok(ProxyConfig::new(addrs, self.clone()))
     }
 }

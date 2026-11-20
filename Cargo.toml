@@ -1,6 +1,6 @@
 [package]
 name = "domain-fronting"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Domain fronting client and server implementation for tunneling connections through HTTP POST requests"
 categories = [ "network-programming" ]
@@ -28,6 +28,7 @@ thiserror = "2.0"
 tokio = { version = "1.42", features = ["net", "io-util", "time", "macros", "sync", "rt-multi-thread", "fs"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 uuid = { version = "1.4.1", features = ["v4"] }
+vec1 = "1.12.1"
 
 # Optional dependencies
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
@@ -37,6 +38,7 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = ["logg
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 webpki-roots = { version = "1.0.7", optional = true }
 kameo = "0.22.1"
+itertools = "0.15.0"
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["test-util", "time"] }
